@@ -65,3 +65,25 @@ def test_execute_worker_rpc_returns_worker_exception():
     assert len(outputs) == 1
     assert isinstance(outputs[0], RuntimeError)
     assert str(outputs[0]) == "test error"
+
+
+@pytest.mark.parametrize("configured,expected_mb", [(None, 24), ("1", 1)])
+def test_worker_response_queue_honors_explicit_memory_limit(
+    monkeypatch, configured, expected_mb
+):
+    """Allow local PP smoke tests in containers with 64 MiB shared memory."""
+    from unittest.mock import Mock
+
+    from vllm.v1.executor import multiproc_executor
+
+    if configured is None:
+        monkeypatch.delenv("VLLM_MQ_MAX_CHUNK_BYTES_MB", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_MQ_MAX_CHUNK_BYTES_MB", configured)
+    queue = Mock()
+    monkeypatch.setattr(multiproc_executor, "MessageQueue", queue)
+    proc = WorkerProc.__new__(WorkerProc)
+    proc.worker = SimpleNamespace(rank=0)
+    config = SimpleNamespace(parallel_config=SimpleNamespace(nnodes_within_dp=1))
+    proc._init_message_queues(None, config)
+    queue.assert_called_once_with(1, 1, max_chunk_bytes=expected_mb * 1024 * 1024)

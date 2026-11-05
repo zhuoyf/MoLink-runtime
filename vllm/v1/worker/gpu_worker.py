@@ -807,6 +807,36 @@ class Worker(WorkerBase):
         ):
             self.model_runner._init_kv_zero_meta()
 
+        if (
+            os.environ.get(
+                "HETVLLM_RESOURCE_MONITOR",
+                os.environ.get("HETVLLM_PP_RECONFIGURE", "0"),
+            )
+            == "1"
+        ):
+            from vllm.distributed.pp_reconfigure.monitor import StageMonitor
+            from vllm.distributed.pp_reconfigure.resource_monitor import (
+                DEFAULT_LOG_DIR,
+                ResourceMonitor,
+            )
+
+            if (
+                self.parallel_config.pipeline_parallel_size,
+                self.parallel_config.tensor_parallel_size,
+                self.parallel_config.data_parallel_size,
+            ) != (2, 1, 1):
+                raise ValueError("resource reporting requires PP=2, TP=1, DP=1")
+            self._molink_monitor = StageMonitor()
+            self._molink_resource_monitor = ResourceMonitor(
+                get_pp_group().rank_in_group,
+                self.molink_monitor,
+                interval=float(
+                    os.environ.get("HETVLLM_RESOURCE_MONITOR_INTERVAL", "1")
+                ),
+                log_dir=os.environ.get("HETVLLM_RESOURCE_MONITOR_LOG", DEFAULT_LOG_DIR),
+            )
+            self._molink_resource_monitor.start()
+
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
@@ -1177,6 +1207,8 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        if monitor := getattr(self, "_molink_monitor", None):
+            monitor.update_requests(scheduler_output)
         # Wait for the previous step's sends so this forward pass cannot
         # overwrite buffers they are still reading.
         _tr = _PP_TRACE_DIR is not None
@@ -1342,10 +1374,26 @@ class Worker(WorkerBase):
             ev1 = torch.cuda.Event(enable_timing=True)
             ev0.record()
             self._pp_ev = (ev0, ev1)
+        _monitor = None
+        _monitor_events = None
+        if forward_pass and (
+            hasattr(self, "_molink_monitor")
+            or os.environ.get("HETVLLM_PP_RECONFIGURE") == "1"
+        ):
+            if not hasattr(self, "_molink_monitor"):
+                from vllm.distributed.pp_reconfigure.monitor import StageMonitor
+
+                self._molink_monitor = StageMonitor()
+            _monitor = self._molink_monitor
+            _monitor_events = _monitor.begin()
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
+            if _monitor is not None:
+                _monitor.end(
+                    _monitor_events, scheduler_output.total_num_scheduled_tokens
+                )
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model
@@ -1507,6 +1555,27 @@ class Worker(WorkerBase):
                     # Proton output names are fixed when the wrapper is constructed.
                     # Recreate it so the next profile_prefix is honored.
                     self.profiler = None
+
+    def molink_migrate(self, action, boundary=None, log_dir=None):
+        from vllm.distributed.pp_reconfigure.worker import migration_rpc
+
+        return migration_rpc(self, action, boundary, log_dir)
+
+    def molink_monitor(self):
+        from vllm.distributed.pp_reconfigure.monitor import StageMonitor
+
+        if not hasattr(self, "_molink_monitor"):
+            self._molink_monitor = StageMonitor()
+        with torch.cuda.device(self.device):
+            return self._molink_monitor.snapshot(self)
+
+    def molink_resource_state(self):
+        monitor = getattr(self, "_molink_resource_monitor", None)
+        return monitor.snapshot() if monitor else None
+
+    def molink_publish_resources(self):
+        monitor = getattr(self, "_molink_resource_monitor", None)
+        return monitor.publish(get_pp_group(), self.device) if monitor else None
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)
@@ -1673,6 +1742,8 @@ class Worker(WorkerBase):
             self.model_runner.reset_lora_state()
 
     def shutdown(self) -> None:
+        if monitor := getattr(self, "_molink_resource_monitor", None):
+            monitor.stop()
         gc.unfreeze()
 
         # has_kv_transfer_group can be None during interpreter shutdown.
