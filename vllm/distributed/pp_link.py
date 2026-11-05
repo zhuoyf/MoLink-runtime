@@ -41,9 +41,10 @@ from __future__ import annotations
 import json
 import os
 import queue
-from collections import deque
 import threading
 import time
+from collections import deque
+from contextlib import suppress
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -133,8 +134,11 @@ class _Codec:
 
     def __init__(self, mode: str):
         self.mode = mode
-        self.group = (int(os.environ.get("HETVLLM_PP_LINK_INT4_GROUP", "32")
-                         or 32) if mode == "int4" else 64)
+        self.group = (
+            int(os.environ.get("HETVLLM_PP_LINK_INT4_GROUP", "32") or 32)
+            if mode == "int4"
+            else 64
+        )
 
     def cpu_need(self, numel: int) -> int:
         if self.mode == "bf16":
@@ -157,23 +161,26 @@ class _Codec:
         N, H = t.shape
         if self.mode == "bf16":
             dst = scratch[: N * H * 2]
-            dst.copy_(t.view(torch.uint8).reshape(-1),
-                      non_blocking=True)
-            return dst, {"codec": "bf16", "n": N, "h": H,
-                         "nbytes": N * H * 2}
+            dst.copy_(t.view(torch.uint8).reshape(-1), non_blocking=True)
+            return dst, {"codec": "bf16", "n": N, "h": H, "nbytes": N * H * 2}
         g = self.group
         assert H % g == 0, H
         x = t.float().view(N, H // g, g)
         amax = x.abs().amax(dim=-1) + 1e-8
         if self.mode == "int4":
-            scale = (amax / 7.0)
+            scale = amax / 7.0
             q = (x / scale.unsqueeze(-1)).clamp(-7, 7).to(torch.int32) & 0xF
             pairs = q.reshape(-1, 2)
             body = (pairs[:, 0] | (pairs[:, 1] << 4)).to(torch.uint8)
         else:
-            scale = (amax / 127.0)
-            body = (x / scale.unsqueeze(-1)).clamp(-127, 127).to(
-                torch.int8).view(torch.uint8).reshape(-1)
+            scale = amax / 127.0
+            body = (
+                (x / scale.unsqueeze(-1))
+                .clamp(-127, 127)
+                .to(torch.int8)
+                .view(torch.uint8)
+                .reshape(-1)
+            )
         sc = scale.to(torch.float16).view(torch.uint8).reshape(-1)
         ns = sc.numel()
         dst = scratch[: ns + body.numel()]
@@ -182,8 +189,7 @@ class _Codec:
         else:
             dst[:ns].copy_(sc.cpu(), non_blocking=False)
             dst[ns:].copy_(body, non_blocking=True)
-        return dst, {"codec": self.mode, "n": N, "h": H,
-                     "nbytes": ns + body.numel()}
+        return dst, {"codec": self.mode, "n": N, "h": H, "nbytes": ns + body.numel()}
 
     def decode_gpu(self, seg: torch.Tensor, tm: dict, device):
         """Wire image -> bf16 [N, H] on `device`.
@@ -195,10 +201,9 @@ class _Codec:
         """
         N, H = tm["n"], tm["h"]
         if tm["codec"] == "bf16":
-            return seg.view(torch.bfloat16).view(N, H).to(
-                device, non_blocking=True)
+            return seg.view(torch.bfloat16).view(N, H).to(device, non_blocking=True)
         g = self.group
-        G = N * (H // g)                       # groups in the message
+        G = N * (H // g)  # groups in the message
         ns = G * 2
         dev = seg.to(device, non_blocking=True)
         scales = dev[:ns].view(torch.float16)  # [G]
@@ -209,12 +214,12 @@ class _Codec:
             g1 = min(G, g0 + _DEC_CHUNK)
             sc = scales[g0:g1].float().unsqueeze(-1)
             if int4:
-                b = body[g0 * g // 2:g1 * g // 2].to(torch.int32)
+                b = body[g0 * g // 2 : g1 * g // 2].to(torch.int32)
                 q = torch.stack((b & 0xF, b >> 4), dim=1).view(g1 - g0, g)
                 q = torch.where(q >= 8, q - 16, q)
             else:
-                q = body[g0 * g:g1 * g].view(torch.int8).view(g1 - g0, g)
-            out[g0 * g:g1 * g] = (q.float() * sc).view(-1).to(torch.bfloat16)
+                q = body[g0 * g : g1 * g].view(torch.int8).view(g1 - g0, g)
+            out[g0 * g : g1 * g] = (q.float() * sc).view(-1).to(torch.bfloat16)
         return out.view(N, H)
 
 
@@ -228,13 +233,13 @@ _CODEC_OBJ = _Codec(_CODEC)
 class _OutMsg:
     mid: int
     header: bytes
-    payload: torch.Tensor          # flat uint8 (pinned scratch or cpu)
+    payload: torch.Tensor  # flat uint8 (pinned scratch or cpu)
     nbytes: int
     prio: int
     event: threading.Event = field(default_factory=threading.Event)
     # CUDA event after the D2H copies (async tx): the send thread waits on
     # it before the first payload byte goes out
-    ready: "torch.cuda.Event | None" = None
+    ready: torch.cuda.Event | None = None
     # set once the last frame is handed to zmq
     queued: threading.Event = field(default_factory=threading.Event)
     bases: list = field(default_factory=list)  # pool buffers to return
@@ -288,7 +293,7 @@ class _RecvFuture:
     order). Returned by recv_tensor_dict_async; consumed by the model
     forward via AsyncIntermediateTensors's handle wait."""
 
-    def __init__(self, link: "PPLink", sid: int):
+    def __init__(self, link: PPLink, sid: int):
         self.link = link
         self.sid = sid
         self.result: dict | None = None
@@ -313,7 +318,7 @@ class _FillHandle:
 
     __slots__ = ("_fut", "_out")
 
-    def __init__(self, fut: "_RecvFuture", out: dict):
+    def __init__(self, fut: _RecvFuture, out: dict):
         self._fut = fut
         self._out = out
 
@@ -322,7 +327,7 @@ class _FillHandle:
         if fut is None:
             return
         self._out.update(fut.wait())
-        fut.result = None    # the dict above is now the only owner
+        fut.result = None  # the dict above is now the only owner
         self._fut = None
 
 
@@ -332,26 +337,33 @@ class PPLink:
         self.lane = None
         self.ctx = None
         self.sock: dict = {}
-        self.send_q: "queue.Queue[_OutMsg | None]" = queue.Queue()
-        self.ack_q: "queue.Queue[int]" = queue.Queue()
+        self.send_q: queue.Queue[_OutMsg | None] = queue.Queue()
+        self.ack_q: queue.Queue[int] = queue.Queue()
         self.pending: dict[int, _OutMsg] = {}
         self.plock = threading.Lock()
         self.unacked = 0
         self.msg_id = 0
-        self.send_sid = 0          # step id of the next message to send
-        self.recv_sid = 0          # step id the next recv call expects
+        self.send_sid = 0  # step id of the next message to send
+        self.recv_sid = 0  # step id the next recv call expects
         self.in_ready: dict[int, _InMsg] = {}
         self._requeue = deque()
-        self.stats = {"sent_msg": 0, "sent_bytes": 0, "recv_msg": 0,
-                      "recv_bytes": 0, "ack_wait_ms": 0.0, "net_wait_ms":
-                      0.0, "hdr_wait_ms": 0.0, "pace_sleep_s": 0.0,
-                      "win_wait_s": 0.0}
+        self.stats = {
+            "sent_msg": 0,
+            "sent_bytes": 0,
+            "recv_msg": 0,
+            "recv_bytes": 0,
+            "ack_wait_ms": 0.0,
+            "net_wait_ms": 0.0,
+            "hdr_wait_ms": 0.0,
+            "pace_sleep_s": 0.0,
+            "win_wait_s": 0.0,
+        }
         self._pool_out: list[torch.Tensor] = []
         self._pool_in: list[torch.Tensor] = []
-        self._in_pend: deque = deque()   # (event, staging buf) in flight
-        self._cap = 4 << 20                # staging buffer size (setup)
+        self._in_pend: deque = deque()  # (event, staging buf) in flight
+        self._cap = 4 << 20  # staging buffer size (setup)
         self._stash: dict[str, deque] = {}
-        self._tok_acc = 0       # scheduled tokens seen (bytes/token audit)
+        self._tok_acc = 0  # scheduled tokens seen (bytes/token audit)
         self._last_dump = 0.0
 
     # ------------------------------------------------------------- setup
@@ -364,10 +376,15 @@ class PPLink:
         # own link instance, both with lane=0 - offset the ports by the DP
         # rank so the two senders on machine A don't fight over one port.
         from vllm.distributed.parallel_state import get_dp_group
+
         self.dp = get_dp_group().rank_in_group
         p = _BASE_PORT + lane * 8 + self.dp * 16
-        for name, port in (("fwd_hi", p), ("fwd_lo", p + 1),
-                           ("bwd_hi", p + 2), ("bwd_lo", p + 3)):
+        for name, port in (
+            ("fwd_hi", p),
+            ("fwd_lo", p + 1),
+            ("bwd_hi", p + 2),
+            ("bwd_lo", p + 3),
+        ):
             s = self.ctx.socket(zmq.PAIR)
             s.setsockopt(zmq.SNDHWM, _HWM)
             s.setsockopt(zmq.RCVHWM, _HWM)
@@ -401,19 +418,15 @@ class PPLink:
             for name, s in socks.items():
                 if name in done:
                     continue
-                try:
+                with suppress(zmq.Again):
                     s.send(b"HS")
-                except zmq.Again:
-                    pass
                 try:
                     m = s.recv()
                 except zmq.Again:
                     continue
                 if m == b"HS":
-                    try:
+                    with suppress(zmq.Again):
                         s.send(b"HA")
-                    except zmq.Again:
-                        pass
                     done.add(name)
                 elif m == b"HA":
                     done.add(name)
@@ -455,10 +468,12 @@ class PPLink:
             for i, t in enumerate(pool):
                 if t.numel() >= need:
                     return pool.pop(i)
-        logger.warning("pp_link: hot-path pinned alloc %d B (pool %s)",
-                       need, "in" if pool is self._pool_in else "out")
-        return torch.empty(max(need, self._cap), dtype=torch.uint8,
-                           pin_memory=True)
+        logger.warning(
+            "pp_link: hot-path pinned alloc %d B (pool %s)",
+            need,
+            "in" if pool is self._pool_in else "out",
+        )
+        return torch.empty(max(need, self._cap), dtype=torch.uint8, pin_memory=True)
 
     def _recycle_in(self):
         while self._in_pend and self._in_pend[0][0].query():
@@ -469,6 +484,7 @@ class PPLink:
         step budget, both tensors in bf16)."""
         try:
             from vllm.config import get_current_vllm_config
+
             cfg = get_current_vllm_config()
             rows = cfg.scheduler_config.max_num_batched_tokens
             hid = cfg.model_config.get_hidden_size()
@@ -481,15 +497,14 @@ class PPLink:
         sender = self.stage == _FROM_STAGE
         pool = self._pool_out if sender else self._pool_in
         for _ in range(_POOL_N * (2 if sender else 1)):
-            pool.append(torch.empty(self._cap, dtype=torch.uint8,
-                                    pin_memory=True))
+            pool.append(torch.empty(self._cap, dtype=torch.uint8, pin_memory=True))
 
     def send_tensor_dict(self, tensor_dict: dict) -> list[MsgHandle]:
         from vllm.distributed.parallel_state import get_tp_group
+
         tp = get_tp_group().world_size
         merged = False
-        if _MERGE and "hidden_states" in tensor_dict and \
-                "residual" in tensor_dict:
+        if _MERGE and "hidden_states" in tensor_dict and "residual" in tensor_dict:
             # plan.md round 3: the next layer consumes s = h + r only via
             # fused add+RMSNorm (norm out, s as the new residual), so the
             # pair carries no independent information - ship s once.
@@ -499,21 +514,23 @@ class PPLink:
             h = tensor_dict["hidden_states"]
             r = tensor_dict["residual"]
             tensor_dict = dict(tensor_dict)
-            tensor_dict["hidden_states"] = (
-                h.float() + r.float()).to(torch.bfloat16)
+            tensor_dict["hidden_states"] = (h.float() + r.float()).to(torch.bfloat16)
             del tensor_dict["residual"]
             merged = True
         self._tok_acc += _STEP_HINT[0]
         parts = []
-        bases = []   # whole pool buffers behind the segment views
+        bases = []  # whole pool buffers behind the segment views
         metas = []
         total = 0
         for k, v in tensor_dict.items():
             if not isinstance(v, torch.Tensor):
                 metas.append({"key": k, "codec": "obj", "nbytes": 0})
                 continue
-            assert v.is_cuda and v.dim() == 2 and \
-                v.dtype == torch.bfloat16, (k, v.shape, v.dtype)
+            assert v.is_cuda and v.dim() == 2 and v.dtype == torch.bfloat16, (
+                k,
+                v.shape,
+                v.dtype,
+            )
             # match the native all-gather optimization: each TP lane sends
             # only its slice of the flattened tensor (half the link bytes)
             flat = v.reshape(-1)
@@ -524,9 +541,15 @@ class PPLink:
             bases.append(base)
             seg, meta = _CODEC_OBJ.encode(flat.view(1, -1), base)
             parts.append(seg)
-            metas.append(meta | {"key": k, "fn": v.shape[0],
-                                 "fh": v.shape[1], "sl": flat.numel() !=
-                                 v.numel()})
+            metas.append(
+                meta
+                | {
+                    "key": k,
+                    "fn": v.shape[0],
+                    "fh": v.shape[1],
+                    "sl": flat.numel() != v.numel(),
+                }
+            )
             total += meta["nbytes"]
         ready = None
         if _ASYNC_TX:
@@ -535,12 +558,24 @@ class PPLink:
         else:
             torch.cuda.current_stream().synchronize()
         mid = self.msg_id
-        hdr = {"id": mid, "sid": self.send_sid, "prio": self._prio(total),
-               "nbytes": total, "tensors": metas,
-               "mg": 1 if merged else 0, "tok": _STEP_HINT[0]}
-        msg = _OutMsg(mid, json.dumps(hdr).encode(),
-                      parts if parts else torch.empty(0, dtype=torch.uint8),
-                      total, hdr["prio"], ready=ready, bases=bases)
+        hdr = {
+            "id": mid,
+            "sid": self.send_sid,
+            "prio": self._prio(total),
+            "nbytes": total,
+            "tensors": metas,
+            "mg": 1 if merged else 0,
+            "tok": _STEP_HINT[0],
+        }
+        msg = _OutMsg(
+            mid,
+            json.dumps(hdr).encode(),
+            parts if parts else torch.empty(0, dtype=torch.uint8),
+            total,
+            hdr["prio"],
+            ready=ready,
+            bases=bases,
+        )
         with self.plock:
             self.pending[mid] = msg
             self.msg_id += 1
@@ -587,18 +622,20 @@ class PPLink:
             nb = tm["nbytes"]
             if nb == 0:
                 continue
-            seg = buf[off:off + nb]
+            seg = buf[off : off + nb]
             t = _CODEC_OBJ.decode_gpu(
-                seg, tm, torch.device("cuda", torch.cuda.current_device()))
+                seg, tm, torch.device("cuda", torch.cuda.current_device())
+            )
             if tm.get("sl"):
                 from vllm.distributed.parallel_state import get_tp_group
+
                 tpg = get_tp_group()
                 # reassemble the full tensor across the intra-machine TP
                 # group (same trick the native path uses, NCCL over PCIe)
-                full = torch.empty(
-                    tm["fn"] * tm["fh"], dtype=t.dtype, device=t.device)
+                full = torch.empty(tm["fn"] * tm["fh"], dtype=t.dtype, device=t.device)
                 torch.distributed.all_gather_into_tensor(
-                    full, t.reshape(-1), group=tpg.device_group)
+                    full, t.reshape(-1), group=tpg.device_group
+                )
                 t = full.view(tm["fn"], tm["fh"])
             else:
                 t = t.view(tm["fn"], tm["fh"])
@@ -610,8 +647,7 @@ class PPLink:
             # exactly the pre-merge semantics, zero extra wire bytes.
             out["residual"] = torch.zeros_like(out["hidden_states"])
         self._tok_acc += int(m.header.get("tok", 0))
-        base = m.base if m.base is not None and m.base.numel() >= (4 << 20) \
-            else None
+        base = m.base if m.base is not None and m.base.numel() >= (4 << 20) else None
         if not _ASYNC_TX:
             torch.cuda.synchronize()
             if base is not None:
@@ -642,10 +678,18 @@ class PPLink:
             if getattr(self, "dp", 0):
                 suffix += f"d{self.dp}"
             with open(f"{_STATS_PATH}{suffix}", "a") as f:
-                f.write(json.dumps({
-                    "t": round(now, 3), "stage": self.stage,
-                    "lane": self.lane, "tok": self._tok_acc,
-                    **self.stats}) + "\n")
+                f.write(
+                    json.dumps(
+                        {
+                            "t": round(now, 3),
+                            "stage": self.stage,
+                            "lane": self.lane,
+                            "tok": self._tok_acc,
+                            **self.stats,
+                        }
+                    )
+                    + "\n"
+                )
         except OSError:
             pass
 
@@ -694,8 +738,7 @@ class PPLink:
             # enqueued message never blocks its own start.
             for prio in (0, 1):
                 st = active[prio]
-                if st is not None and st[3] == 0 and _WIN > 0 and \
-                        self.unacked > _WIN:
+                if st is not None and st[3] == 0 and _WIN > 0 and self.unacked > _WIN:
                     t0 = time.time()
                     while self.unacked > _WIN:
                         self._drain_acks(0.0)
@@ -714,8 +757,7 @@ class PPLink:
             msg, si, so, off = st
             n = msg.nbytes
             if off == 0:
-                self._dir_sock(msg.prio, forward=True).send(
-                    msg.header, zmq.SNDMORE)
+                self._dir_sock(msg.prio, forward=True).send(msg.header, zmq.SNDMORE)
             now = time.perf_counter()
             if _RATE > 0:
                 bucket = min(bucket + (now - last) * _RATE, _RATE)
@@ -734,7 +776,8 @@ class PPLink:
                 with self.plock:
                     self.unacked += n
             self._dir_sock(msg.prio, forward=True).send(
-                frame, 0 if st[3] >= n else zmq.SNDMORE)
+                frame, 0 if st[3] >= n else zmq.SNDMORE
+            )
             if st[3] >= n:
                 msg.queued.set()
                 self.stats["sent_msg"] += 1
@@ -770,8 +813,11 @@ class PPLink:
         poller = zmq.Poller()
         # the hop's receiver (stage _FROM_STAGE + 1) polls the forward
         # sockets; the sender polls the backward ones (acks)
-        mine = ("fwd_hi", "fwd_lo") if self.stage == _FROM_STAGE + 1 \
+        mine = (
+            ("fwd_hi", "fwd_lo")
+            if self.stage == _FROM_STAGE + 1
             else ("bwd_hi", "bwd_lo")
+        )
         for name in mine:
             poller.register(self.sock[name], zmq.POLLIN)
         while True:
@@ -810,10 +856,8 @@ class PPLink:
         hdr = next_frame()
         if hdr in (b"HS", b"HA"):
             if hdr == b"HS":
-                try:
+                with suppress(zmq.Again):
                     s.send(b"HA")
-                except zmq.Again:
-                    pass
             return
         try:
             h = json.loads(hdr)
@@ -831,21 +875,22 @@ class PPLink:
             got = next_frame(copy=False)
             take = min(len(got), remaining)
             # one memcpy straight into the pinned staging buffer
-            dst[off:off + take] = np.frombuffer(got, dtype=np.uint8,
-                                                count=take)
+            dst[off : off + take] = np.frombuffer(got, dtype=np.uint8, count=take)
             off += take
             remaining -= take
         m.base = buf
-        m.buf = buf[:m.nbytes] if buf is not None else \
-            torch.empty(0, dtype=torch.uint8)
+        m.buf = (
+            buf[: m.nbytes] if buf is not None else torch.empty(0, dtype=torch.uint8)
+        )
         m.t_ready = time.time()
         m.event.set()
         self.in_ready[h["sid"]] = m
         self.stats["recv_msg"] += 1
         self.stats["recv_bytes"] += m.nbytes
         self._stats_dump()
-        self._dir_sock(0, forward=not (self.stage == _FROM_STAGE + 1)).send(
-            json.dumps({"ack": str(h["id"])}).encode())
+        self._dir_sock(0, forward=self.stage != _FROM_STAGE + 1).send(
+            json.dumps({"ack": str(h["id"])}).encode()
+        )
 
     def _complete_ack(self, mid: int):
         """Ack handling happens on the recv thread: complete the pending
@@ -862,8 +907,7 @@ class PPLink:
         if frames ever land here."""
         while True:
             try:
-                mid = self.ack_q.get(
-                    timeout=timeout if timeout > 0 else 0.0)
+                mid = self.ack_q.get(timeout=timeout if timeout > 0 else 0.0)
             except queue.Empty:
                 return
             self._complete_ack(mid)
@@ -903,11 +947,13 @@ def get_link() -> PPLink:
             if not (_BIND_IP and _PEER_IP):
                 raise RuntimeError(
                     "HETVLLM_PP_LINK=1 needs HETVLLM_PP_LINK_BIND (stage-0 "
-                    "host IP) and HETVLLM_PP_LINK_PEER (stage-1 host IP)")
-            from vllm.distributed.parallel_state import (
-                get_pp_group, get_tp_group)
+                    "host IP) and HETVLLM_PP_LINK_PEER (stage-1 host IP)"
+                )
+            from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+
             lnk = PPLink()
-            lnk.setup(stage=get_pp_group().rank_in_group,
-                      lane=get_tp_group().rank_in_group)
+            lnk.setup(
+                stage=get_pp_group().rank_in_group, lane=get_tp_group().rank_in_group
+            )
             _LINK = lnk
         return _LINK
