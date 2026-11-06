@@ -9,6 +9,7 @@ from fastapi import APIRouter, FastAPI, HTTPException, Request
 from pydantic import BaseModel, StrictInt
 
 from vllm.distributed.pp_reconfigure.control import ReconfigurationController
+from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
 
 router = APIRouter(prefix="/molink")
 
@@ -46,7 +47,7 @@ async def reconfigure(body: ReconfigureRequest, request: Request):
         return await asyncio.shield(
             controller(request).reconfigure(body.boundary, body.mode, body.verify_kv)
         )
-    except ValueError as exc:
+    except ReconfigurationValidationError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -74,7 +75,7 @@ async def resize_kv(body: ResizeRequest, request: Request):
             return await control.engine.engine_core.call_utility_async(
                 "molink_resize_kv", body.num_blocks
             )
-        except ValueError as exc:
+        except ReconfigurationValidationError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 

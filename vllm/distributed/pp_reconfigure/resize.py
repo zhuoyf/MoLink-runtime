@@ -2,12 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Scheduler half of PipeLive resizing; live logical block IDs stay stable."""
 
+from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
 
 def plan_resize(pool, capacity):
     if type(capacity) is not int or capacity < 2:
-        raise ValueError("KV capacity must be an integer >= 2 (including null block)")
+        raise ReconfigurationValidationError(
+            "KV capacity must be an integer >= 2 (including null block)"
+        )
     disabled: set[int] = getattr(pool, "_pipelive_disabled", set())
     delta = capacity - pool.num_gpu_blocks
     if delta < 0:
@@ -19,7 +22,9 @@ def plan_resize(pool, capacity):
             and block.ref_cnt == 0
         ]
         if len(free) < -delta:
-            raise ValueError("KV shrink would release active request blocks")
+            raise ReconfigurationValidationError(
+                "KV shrink would release active request blocks"
+            )
         return {"capacity": capacity, "remove": free[:-delta], "add": []}
     restored = sorted(disabled)[:delta]
     new_ids = list(range(len(pool.blocks), len(pool.blocks) + delta - len(restored)))

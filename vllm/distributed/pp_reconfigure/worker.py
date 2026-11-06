@@ -13,6 +13,7 @@ import torch
 import vllm.envs as envs
 from vllm.config import set_current_vllm_config
 from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
 from vllm.distributed.pp_reconfigure.monitor import write_event
 from vllm.distributed.pp_reconfigure.transport import NixlTransport, PPTransport
 from vllm.distributed.pp_reconfigure.weights import (
@@ -27,7 +28,9 @@ from vllm.v1.worker.utils import allocate_kv_cache, bind_kv_cache
 
 def layer_range(stage: int, boundary: int, total: int) -> tuple[int, int]:
     if type(boundary) is not int or not 0 < boundary < total:
-        raise ValueError(f"boundary must be an integer in [1, {total - 1}]")
+        raise ReconfigurationValidationError(
+            f"boundary must be an integer in [1, {total - 1}]"
+        )
     return (0, boundary) if stage == 0 else (boundary, total)
 
 
@@ -68,18 +71,20 @@ class LayerMigration:
         from vllm.model_executor.models.llama import LlamaForCausalLM
 
         if os.environ.get("HETVLLM_PP_RECONFIGURE") != "1":
-            raise ValueError("set HETVLLM_PP_RECONFIGURE=1 on every worker")
+            raise ReconfigurationValidationError(
+                "set HETVLLM_PP_RECONFIGURE=1 on every worker"
+            )
         parallel = config.parallel_config
         if (
             parallel.pipeline_parallel_size,
             parallel.tensor_parallel_size,
             parallel.data_parallel_size,
         ) != (2, 1, 1):
-            raise ValueError("prototype requires PP=2, TP=1, DP=1")
+            raise ReconfigurationValidationError("prototype requires PP=2, TP=1, DP=1")
         if not config.model_config.enforce_eager:
-            raise ValueError("prototype requires --enforce-eager")
+            raise ReconfigurationValidationError("prototype requires --enforce-eager")
         if type(self.runner.get_model()) is not LlamaForCausalLM:
-            raise ValueError("prototype supports LlamaForCausalLM")
+            raise ReconfigurationValidationError("prototype supports LlamaForCausalLM")
         if any(
             (
                 config.quant_config,
@@ -88,15 +93,21 @@ class LayerMigration:
                 config.kv_transfer_config,
             )
         ):
-            raise ValueError("requires plain weights and local full-attention KV")
+            raise ReconfigurationValidationError(
+                "requires plain weights and local full-attention KV"
+            )
         groups = self.runner.kv_cache_config.kv_cache_groups
         if len(groups) != 1 or type(groups[0].kv_cache_spec) is not FullAttentionSpec:
-            raise ValueError("requires one uniform FullAttentionSpec KV group")
+            raise ReconfigurationValidationError(
+                "requires one uniform FullAttentionSpec KV group"
+            )
         if groups[0].kv_cache_spec.kv_quant_mode != 0:
-            raise ValueError("prototype requires unquantized KV")
+            raise ReconfigurationValidationError("prototype requires unquantized KV")
         backend = os.environ.get("HETVLLM_PP_KV_TRANSPORT", "nixl")
         if backend not in ("nixl", "pp"):
-            raise ValueError("HETVLLM_PP_KV_TRANSPORT must be nixl or pp")
+            raise ReconfigurationValidationError(
+                "HETVLLM_PP_KV_TRANSPORT must be nixl or pp"
+            )
         local_weight_files(config)
         start, end = layer_range(
             self.stage, boundary, self.model.config.num_hidden_layers
@@ -105,7 +116,7 @@ class LayerMigration:
             self.model.end_layer if self.stage == 0 else self.model.start_layer
         )
         if old_boundary == boundary:
-            raise ValueError("boundary already active")
+            raise ReconfigurationValidationError("boundary already active")
         return {
             "stage": self.stage,
             "old_boundary": old_boundary,
@@ -347,6 +358,8 @@ class LayerMigration:
         tx.transport.close()
         self.prepared = None
         del tx
+        # Startup freezes weight/loader cycles; retired weights must be collectable.
+        gc.unfreeze()
         gc.collect()
         torch.accelerator.empty_cache()
         return {"finalized": True}
@@ -436,7 +449,13 @@ def migration_rpc(worker, action, boundary=None, log_dir=None):
             raise ValueError(f"unknown migration action {action}")
         result = {"ok": True, **result}
     except Exception as exc:
-        result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        result = {
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "error_category": "validation"
+            if isinstance(exc, ReconfigurationValidationError)
+            else "internal",
+        }
     result.update(
         stage=get_pp_group().rank_in_group,
         elapsed_ms=(time.perf_counter() - started) * 1000,

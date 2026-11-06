@@ -509,6 +509,7 @@ def test_inference_marks_optional_block_copies_without_advancing_token_count(
 
     live = LiveLayerMigration.__new__(LiveLayerMigration)
     live.stage, live.step_count = 0, 0
+    live.log_dir = None
     live.bitmap = DirtyBitmap(64)
     handle = torch.empty(0)
     handle._pipelive = (
@@ -616,6 +617,10 @@ async def test_async_streams_before_pause_and_syncs_before_commit(tmp_path, fail
                         communication_intervals_ms=[(2, 4)],
                         bytes=100,
                         steps=3,
+                        scheduled=9,
+                        applied=9,
+                        dirty_slots=0,
+                        kv_ready=True,
                     )
             return workers
 
@@ -696,7 +701,7 @@ def test_resize_commits_scheduler_only_after_all_workers_prepare(failure):
     core.collective_rpc = Mock(side_effect=rpc)
     with patch.dict("os.environ", {"HETVLLM_PIPELIVE": "1"}):
         if failure:
-            with pytest.raises(ValueError):
+            with pytest.raises(RuntimeError):
                 core.molink_resize_kv(4)
             if failure == "prepare":
                 assert pool.num_gpu_blocks == 8
@@ -714,3 +719,206 @@ def test_resize_commits_scheduler_only_after_all_workers_prepare(failure):
         else:
             core.molink_resize_kv(4)
             assert pool.num_gpu_blocks == 4 and manager.watermark_blocks == 1
+
+
+@pytest.mark.parametrize("error", [ValueError("internal"), RuntimeError("internal")])
+def test_internal_worker_errors_are_not_validation_conflicts(error):
+    from vllm.distributed.pp_reconfigure.worker import migration_rpc
+
+    migration = SimpleNamespace(describe=lambda boundary: (_ for _ in ()).throw(error))
+    worker = SimpleNamespace(_molink_migration=migration)
+    with patch(
+        "vllm.distributed.pp_reconfigure.worker.get_pp_group",
+        return_value=SimpleNamespace(rank_in_group=0),
+    ):
+        result = migration_rpc(worker, "describe", 12)
+    assert result["error_category"] == "internal"
+    with pytest.raises(RuntimeError):
+        validate_workers([result, {"ok": True, "stage": 1}])
+
+
+@pytest.mark.parametrize("validation", [True, False])
+def test_utility_rpc_preserves_only_explicit_validation_errors(validation):
+    from concurrent.futures import Future
+
+    import msgspec
+
+    from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
+    from vllm.v1.engine import UtilityOutput
+    from vllm.v1.engine.core import EngineCoreProc
+    from vllm.v1.engine.core_client import _process_utility_output
+
+    error_type = ReconfigurationValidationError if validation else ValueError
+
+    def fail():
+        raise error_type("rejected")
+
+    outputs = []
+    EngineCoreProc._invoke_utility_method(
+        "molink_resize_kv", fail, UtilityOutput(7), outputs.append
+    )
+    decoded = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(outputs[0]), type=UtilityOutput
+    )
+    future = Future()
+    _process_utility_output(decoded, {7: future})
+    assert isinstance(future.exception(), ReconfigurationValidationError) == validation
+
+
+@pytest.mark.asyncio
+async def test_validation_failure_keeps_conflict_type_and_does_not_pause(tmp_path):
+    from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
+
+    class InvalidEngine(Engine):
+        async def call_utility_async(self, method, *args):
+            return [
+                {
+                    "stage": i,
+                    "ok": False,
+                    "error_category": "validation",
+                    "error": "unaligned boundary",
+                }
+                for i in range(2)
+            ]
+
+    engine = InvalidEngine()
+    with pytest.raises(ReconfigurationValidationError, match="unchanged"):
+        await ReconfigurationController(engine, tmp_path).reconfigure(13)
+    assert not engine.paused
+
+
+def test_finalize_collects_old_cyclic_weights_before_return():
+    import gc
+    import weakref
+
+    from vllm.distributed.pp_reconfigure.live import LiveLayerMigration
+
+    class OldLayer:
+        pass
+
+    old = OldLayer()
+    old.weight_loader = old  # Real parameters hold bound methods back to the layer.
+    reference = weakref.ref(old)
+    migration = LiveLayerMigration.__new__(LiveLayerMigration)
+    migration.stage = 1
+    migration.prepared = SimpleNamespace(
+        committed=True,
+        source=0,
+        old_layers=[old],
+        transport=SimpleNamespace(close=lambda: None),
+    )
+    gc.freeze()
+    del old
+    try:
+        with patch("torch.accelerator.empty_cache"):
+            migration.finalize()
+        assert reference() is None
+    finally:
+        gc.unfreeze()
+
+
+@pytest.mark.parametrize("pending", ["dirty", "unapplied", "not_ready"])
+@pytest.mark.asyncio
+async def test_pending_kv_updates_prevent_commit(tmp_path, pending):
+    class PendingEngine(Engine):
+        async def call_utility_async(self, method, *args):
+            workers = await super().call_utility_async(method, *args)
+            if method == "molink_state":
+                return workers
+            for w in workers:
+                w.update(
+                    pipelive=True,
+                    source=0,
+                    max_intermediate_blocks=64,
+                    max_final_blocks=64,
+                    num_blocks=64,
+                )
+                if args[0] == "load_and_transfer":
+                    w.update(
+                        kv_ready=pending != "not_ready",
+                        dirty_slots=0,
+                        scheduled=9,
+                        applied=9,
+                    )
+                    if w["stage"] == 0 and pending == "dirty":
+                        w["dirty_slots"] = 1
+                    if w["stage"] == 1 and pending == "unapplied":
+                        w["applied"] = 8
+            return workers
+
+    engine = PendingEngine()
+    with pytest.raises(RuntimeError, match="required KV updates remain"):
+        await ReconfigurationController(engine, tmp_path).reconfigure(12)
+    assert "commit" not in engine.calls
+    assert engine.calls[-2:] == ["rollback", "resume"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_incoming_sparse_cache_allocates_only_retained_blocks():
+    from vllm.distributed.pp_reconfigure.cache import StackedKVCache
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=64, dtype=torch.float16
+    )
+    names = [f"model.layers.{i}.self_attn.attn" for i in range(2)]
+    pool = StackedKVCache(names, spec, 0, torch.device("cuda:0"))
+    pool.add_blocks([0, 63])
+    assert set(pool.stacks) == {0, 63}
+    assert pool.allocated_bytes == 2 * pool.allocation_bytes
+    assert pool.handles[names[0]].numel() == 64
+    assert not pool.handles[names[0]][1:63].any()
+
+
+@pytest.mark.asyncio
+async def test_insufficient_migration_budget_rejected_before_mutation(tmp_path):
+    from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
+
+    class NoCapacityEngine(Engine):
+        async def call_utility_async(self, method, *args):
+            workers = await super().call_utility_async(method, *args)
+            for w in workers:
+                w.update(pipelive=True, max_intermediate_blocks=0, max_final_blocks=0)
+            return workers
+
+    engine = NoCapacityEngine()
+    with pytest.raises(ReconfigurationValidationError, match="insufficient memory"):
+        await ReconfigurationController(engine, tmp_path).reconfigure(12)
+    assert engine.calls == ["describe"]
+    assert not engine.paused
+
+
+@pytest.mark.parametrize("kind, status", [("validation", 409), ("internal", 500)])
+@pytest.mark.parametrize(
+    "endpoint, payload",
+    [
+        ("/molink/reconfigure", {"boundary": 13}),
+        ("/molink/resize_kv", {"num_blocks": 1}),
+    ],
+)
+def test_http_conflicts_do_not_hide_internal_errors(kind, status, endpoint, payload):
+    import asyncio
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
+    from vllm.entrypoints.serve.dev.molink import api_router
+
+    async def fail(*args):
+        if kind == "validation":
+            raise ReconfigurationValidationError("invalid request")
+        raise ValueError("internal bug")
+
+    control = SimpleNamespace(
+        lock=asyncio.Lock(),
+        reconfigure=fail,
+        engine=SimpleNamespace(engine_core=SimpleNamespace(call_utility_async=fail)),
+    )
+    app = FastAPI()
+    app.include_router(api_router.router)
+    with (
+        patch.object(api_router, "controller", return_value=control),
+        TestClient(app, raise_server_exceptions=False) as client,
+    ):
+        assert client.post(endpoint, json=payload).status_code == status

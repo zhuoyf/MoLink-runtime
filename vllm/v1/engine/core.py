@@ -1773,6 +1773,12 @@ class EngineCoreProc(EngineCore):
         except Exception as e:
             logger.exception("Invocation of %s method failed", name)
             output.failure_message = f"Call to {name} method failed: {str(e)}"
+            from vllm.distributed.pp_reconfigure.errors import (
+                ReconfigurationValidationError,
+            )
+
+            if isinstance(e, ReconfigurationValidationError):
+                output.failure_category = "validation"
         enqueue_output(output)
 
     @staticmethod

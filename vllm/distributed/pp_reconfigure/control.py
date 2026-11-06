@@ -6,6 +6,7 @@ import time
 import uuid
 from pathlib import Path
 
+from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
 from vllm.distributed.pp_reconfigure.monitor import write_event
 
 
@@ -14,7 +15,12 @@ def validate_workers(workers):
         raise ValueError("expected exactly two pipeline workers")
     failures = [w for w in workers if not w.get("ok")]
     if failures:
-        raise ValueError(str(failures))
+        error_type = (
+            ReconfigurationValidationError
+            if all(w.get("error_category") == "validation" for w in failures)
+            else RuntimeError
+        )
+        raise error_type(str(failures))
     for key in (
         "old_boundary",
         "boundary",
@@ -43,9 +49,9 @@ class ReconfigurationController:
 
     async def reconfigure(self, boundary, mode="sync", verify_kv=False):
         if mode not in ("sync", "async"):
-            raise ValueError("migration mode must be sync or async")
+            raise ReconfigurationValidationError("migration mode must be sync or async")
         if self.lock.locked():
-            raise ValueError("a reconfiguration is already running")
+            raise ReconfigurationValidationError("a reconfiguration is already running")
         async with self.lock:
             run_id = uuid.uuid4().hex
             directory = str(self.log_root / run_id)
@@ -86,12 +92,16 @@ class ReconfigurationController:
 
             try:
                 if await self.engine.is_paused():
-                    raise ValueError("engine is already paused")
+                    raise ReconfigurationValidationError("engine is already paused")
                 descriptions = await phase("validate", lambda: rpc("describe"))
                 resize_restore = None
                 if all(w.get("pipelive") for w in descriptions):
                     shrink = min(w["max_intermediate_blocks"] for w in descriptions)
                     resize_restore = min(w["max_final_blocks"] for w in descriptions)
+                    if shrink < 2 or resize_restore < 2:
+                        raise ReconfigurationValidationError(
+                            "insufficient memory for migration and null/live KV blocks"
+                        )
                     if shrink < descriptions[0]["num_blocks"]:
                         await phase(
                             "resize_before",
@@ -101,7 +111,7 @@ class ReconfigurationController:
                         )
                 if mode == "async":
                     if not all(w.get("pipelive") for w in descriptions):
-                        raise ValueError(
+                        raise ReconfigurationValidationError(
                             "async migration requires HETVLLM_PIPELIVE=1 at startup"
                         )
                     background_started = True
@@ -154,6 +164,18 @@ class ReconfigurationController:
                     )
                     if all(w.get("pipelive") for w in descriptions):
                         live_stats = parallel
+                if live_stats is not None:
+                    source = next(w for w in live_stats if w["stage"] == w["source"])
+                    destination = next(
+                        w for w in live_stats if w["stage"] != w["source"]
+                    )
+                    if (
+                        not all(w["kv_ready"] for w in live_stats)
+                        or source["dirty_slots"]
+                        or source["scheduled"] != source["applied"]
+                        or source["scheduled"] != destination["applied"]
+                    ):
+                        raise RuntimeError("required KV updates remain before commit")
                 verification = None
                 if verify_kv:
                     verification = await phase(
@@ -253,6 +275,12 @@ class ReconfigurationController:
                     recovery=recovery,
                     timings_ms=timings,
                 )
-                raise RuntimeError(
+                error_type = (
+                    ReconfigurationValidationError
+                    if isinstance(exc, ReconfigurationValidationError)
+                    and recovery in ("unchanged", "rolled_back_and_resumed")
+                    else RuntimeError
+                )
+                raise error_type(
                     f"{exc}; recovery={recovery}; logs={directory}"
                 ) from exc

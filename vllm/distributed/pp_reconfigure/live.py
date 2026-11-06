@@ -13,6 +13,7 @@ from vllm.config import set_current_vllm_config
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.distributed.pp_reconfigure.cache import StackedKVCache
 from vllm.distributed.pp_reconfigure.communication import MigrationChannel
+from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
 from vllm.distributed.pp_reconfigure.monitor import write_event
 from vllm.distributed.pp_reconfigure.patching import DirtyBitmap, copy_slots
 from vllm.distributed.pp_reconfigure.worker import (
@@ -49,9 +50,13 @@ class LiveLayerMigration(LayerMigration):
         result = super().describe(boundary)
         k = int(os.environ.get("HETVLLM_PIPELIVE_STACK", "2"))
         if boundary % k or result["old_boundary"] % k:
-            raise ValueError("boundary must align to PipeLive stacking factor")
+            raise ReconfigurationValidationError(
+                "boundary must align to PipeLive stacking factor"
+            )
         if not all(hasattr(cache, "_pipelive") for cache in self.runner.kv_caches):
-            raise ValueError("PipeLive requires address-based caches at startup")
+            raise ReconfigurationValidationError(
+                "PipeLive requires address-based caches at startup"
+            )
         result["pipelive"] = True
         pools = {cache._pipelive[0] for cache in self.runner.kv_caches}
         existing = set(self.runner.kv_cache_config.kv_cache_groups[0].layer_names)
@@ -97,6 +102,16 @@ class LiveLayerMigration(LayerMigration):
                 result["max_intermediate_blocks"], cap
             )
             result["max_final_blocks"] = min(result["max_final_blocks"], cap)
+        result["capacity_memory"] = {
+            "budget_bytes": budget,
+            "non_kv_bytes": non_kv,
+            "kv_bytes": allocated,
+            "incoming_weights_bytes": incoming_weights,
+            "device_free_bytes": free,
+            "allocator_free_bytes": allocator_free,
+            "intermediate_bytes_per_block": intermediate,
+            "final_bytes_per_block": final,
+        }
         return result
 
     def prepare(self, boundary):
@@ -106,7 +121,17 @@ class LiveLayerMigration(LayerMigration):
         return {"connected": True}
 
     def load_weights(self):
+        if self.log_dir:
+            write_event(self.log_dir, "weight_load", event="begin", stage=self.stage)
         self.weight_result = super().load_weights()
+        if self.log_dir:
+            write_event(
+                self.log_dir,
+                "weight_load",
+                event="end",
+                stage=self.stage,
+                **self.weight_result,
+            )
         return self.weight_result
 
     def load_and_transfer(self, log_dir=None):
@@ -200,11 +225,11 @@ class LiveLayerMigration(LayerMigration):
                 incoming = StackedKVCache(
                     [f"model.layers.{i}.self_attn.attn" for i in moving],
                     spec,
-                    max(existing_ids) + 1,
+                    0,
                     self.worker.device,
                     int(os.environ.get("HETVLLM_PIPELIVE_STACK", "2")),
                 )
-                incoming.remove_blocks(set(incoming.stacks) - existing_ids)
+                incoming.add_blocks(sorted(existing_ids))
             new_context = {name: context[name] for name in names}
         finally:
             for name in set(context) - old_context.keys():
@@ -234,6 +259,8 @@ class LiveLayerMigration(LayerMigration):
         self.finish = threading.Event()
         self.compute_intervals = []
         self.communication_intervals = []
+        self.patch_intervals = []
+        self.patch_rounds = 0
         self.compute_events = None
         self.step_count = 0
         self.gathered = None
@@ -257,10 +284,7 @@ class LiveLayerMigration(LayerMigration):
             and self.stage == tx.source
         ):
             self.gpu_profiler = torch.profiler.profile(
-                activities=[
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ]
+                activities=[torch.profiler.ProfilerActivity.CUDA]
             )
             self.gpu_profiler.start()
         self.active = True
@@ -321,6 +345,15 @@ class LiveLayerMigration(LayerMigration):
             self.bitmap.mark(copied_slots, advance=False)
             self.last_write = torch.cuda.Event()
             self.last_write.record()
+            if self.log_dir:
+                write_event(
+                    self.log_dir,
+                    "dirty",
+                    stage=self.stage,
+                    slots=len(slots),
+                    copied_slots=len(copied_slots),
+                    scheduled=self.bitmap.scheduled,
+                )
 
     def _send_snapshot(self, slots, watermark, full=False):
         tx = self._transaction()
@@ -353,13 +386,27 @@ class LiveLayerMigration(LayerMigration):
                     "shape": list(payload.shape),
                     "dtype": str(payload.dtype).removeprefix("torch."),
                 }
+                if self.log_dir:
+                    write_event(
+                        self.log_dir,
+                        "patch_submit",
+                        stage=self.stage,
+                        slots=len(chunk),
+                        watermark=watermark,
+                        full=full,
+                        last=metadata["last"],
+                        layer=name,
+                    )
                 events = self.channel.send(payload, metadata)
                 self.communication_intervals.append(events)
+                if not full and chunk:
+                    self.patch_intervals.append(events)
                 self.bytes_sent += payload.numel() * payload.element_size()
                 if self.log_dir:
                     write_event(
                         self.log_dir,
                         "patch",
+                        event="nccl_complete_and_applied",
                         stage=self.stage,
                         slots=len(chunk),
                         bytes=payload.numel() * payload.element_size(),
@@ -369,6 +416,7 @@ class LiveLayerMigration(LayerMigration):
                     )
         self.applied = watermark
         self.full_done |= full
+        self.patch_rounds += bool(slots) and not full
 
     def _send_loop(self):
         tx = self._transaction()
@@ -401,7 +449,19 @@ class LiveLayerMigration(LayerMigration):
             copy_slots(tx.new_kv[metadata["layer"]], metadata["slots"], payload)
             self.channel.stream.synchronize()
             self.bytes_sent += payload.numel() * payload.element_size()
+            if self.log_dir:
+                write_event(
+                    self.log_dir,
+                    "patch_applied",
+                    stage=self.stage,
+                    slots=len(metadata["slots"]),
+                    watermark=metadata["watermark"],
+                    full=metadata["full"],
+                    last=metadata["last"],
+                    layer=metadata["layer"],
+                )
             if metadata["last"]:
+                self.patch_rounds += bool(metadata["slots"]) and not metadata["full"]
                 self.applied = metadata["watermark"]
                 self.full_done |= metadata["full"]
 
@@ -418,6 +478,9 @@ class LiveLayerMigration(LayerMigration):
             "weights_ready": tx.weights_ready,
             "scheduled": self.bitmap.scheduled,
             "applied": self.applied,
+            "dirty_slots": int(self.bitmap.bits.sum()),
+            "patch_rounds": self.patch_rounds,
+            "kv_ready": tx.kv_ready,
             "steps": self.step_count,
             "bytes": self.bytes_sent,
             "source": tx.source,
@@ -463,6 +526,10 @@ class LiveLayerMigration(LayerMigration):
             communication_intervals_ms=[
                 (self.anchor.elapsed_time(a), self.anchor.elapsed_time(b))
                 for a, b in self.communication_intervals
+            ],
+            patch_intervals_ms=[
+                (self.anchor.elapsed_time(a), self.anchor.elapsed_time(b))
+                for a, b in self.patch_intervals
             ],
             handshake_rejections=self.channel.rejections,
         )
@@ -535,4 +602,5 @@ class LiveLayerMigration(LayerMigration):
             pools = {tx.old_kv[name]._pipelive[0] for name in names}
             for pool in pools:
                 pool.retire_layers(names)
+        del tx
         return super().finalize()
