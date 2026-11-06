@@ -154,10 +154,10 @@ class LayerMigration:
             weight_bytes = len(moving) * sum(
                 t.numel() * t.element_size() for t in exemplar.state_dict().values()
             )
-        free, _ = torch.cuda.mem_get_info(self.worker.device)
-        allocator_free = torch.cuda.memory_reserved(
+        free, _ = torch.accelerator.get_memory_info(self.worker.device)
+        allocator_free = torch.accelerator.memory_reserved(
             self.worker.device
-        ) - torch.cuda.memory_allocated(self.worker.device)
+        ) - torch.accelerator.memory_allocated(self.worker.device)
         required = new_config.kv_cache_tensors[0].size + weight_bytes + (32 << 20)
         if required > free + allocator_free:
             raise ValueError(
@@ -190,7 +190,7 @@ class LayerMigration:
             for name in names:
                 if name in old_kv:
                     new_kv[name].copy_(old_kv[name])
-            torch.cuda.synchronize(self.worker.device)
+            torch.accelerator.synchronize(self.worker.device)
         finally:
             context.clear()
             context.update(old_context)
@@ -230,7 +230,7 @@ class LayerMigration:
         tx = self._transaction()
         result = {"loaded_bytes": 0, "layers": []}
         if self.stage != tx.source:
-            with torch.cuda.device(self.worker.device):
+            with torch.accelerator.device_index(self.worker.device.index):
                 stream = torch.cuda.Stream(device=self.worker.device)
                 try:
                     with (
@@ -329,7 +329,7 @@ class LayerMigration:
         self.prepared = None
         del tx
         gc.collect()
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
         boundary = self.model.end_layer if self.stage == 0 else self.model.start_layer
         return {"rolled_back": True, "partition": self._set_partition(boundary)}
 
@@ -348,7 +348,7 @@ class LayerMigration:
         self.prepared = None
         del tx
         gc.collect()
-        torch.cuda.empty_cache()
+        torch.accelerator.empty_cache()
         return {"finalized": True}
 
     def _transaction(self) -> Prepared:
@@ -413,11 +413,24 @@ def migration_rpc(worker, action, boundary=None, log_dir=None):
         if not hasattr(worker, "_molink_migration"):
             worker._molink_migration = LayerMigration(worker)
         migration = worker._molink_migration
-        if action in ("describe", "prepare"):
+        if action in ("describe", "prepare", "prepare_live", "prepare_resize_live"):
             result = getattr(migration, action)(boundary)
+        elif action == "start_live":
+            result = migration.start_live(log_dir)
         elif action == "load_and_transfer":
             result = migration.load_and_transfer(log_dir)
-        elif action in ("connect", "commit", "rollback", "finalize"):
+        elif action in (
+            "connect",
+            "commit",
+            "rollback",
+            "finalize",
+            "progress_live",
+            "prepared_live",
+            "commit_resize_live",
+            "rollback_resize_live",
+            "sync_live",
+            "verify_live",
+        ):
             result = getattr(migration, action)()
         else:
             raise ValueError(f"unknown migration action {action}")

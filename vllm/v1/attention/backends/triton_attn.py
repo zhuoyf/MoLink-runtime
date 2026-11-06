@@ -602,7 +602,14 @@ class TritonAttentionImpl(AttentionImpl):
         # Per-token-head quantized KV cache: handled by the core unified
         # kernel, which dequantizes per-(token, head) inline via constexpr
         # branches (INT8 / FP8) and dispatches to the packed INT4 kernel.
-        if self._is_per_token_head_quant:
+        address_cache = getattr(kv_cache, "_pipelive", None)
+        if address_cache is not None:
+            pool, name = address_cache
+            key_cache, value_cache = pool.key_value(name)
+            q_descale = None
+            k_descale = v_descale = None
+            k_scale_cache = v_scale_cache = None
+        elif self._is_per_token_head_quant:
             key_cache, value_cache = self._pth_key_value_caches(kv_cache)
             k_scale_cache = self._k_scale_cache
             v_scale_cache = self._v_scale_cache
@@ -640,6 +647,8 @@ class TritonAttentionImpl(AttentionImpl):
         max_seqlen_q = attn_metadata.max_query_len
         max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
+        if address_cache is not None:
+            block_table = kv_cache[block_table.long()]
 
         seq_threshold_3D = attn_metadata.seq_threshold_3D
         num_par_softmax_segments = attn_metadata.num_par_softmax_segments
@@ -683,6 +692,7 @@ class TritonAttentionImpl(AttentionImpl):
             v_scale_cache=v_scale_cache,
             chunk_lookback=self.chunk_lookback,
             use_td=self.use_td,
+            block_table_is_address=address_cache is not None,
             mm_prefix_clamp_sliding_window=getattr(
                 layer, "mm_prefix_clamp_sliding_window", False
             ),
@@ -760,6 +770,23 @@ class TritonAttentionImpl(AttentionImpl):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
+            return
+        address_cache = getattr(kv_cache, "_pipelive", None)
+        if address_cache is not None:
+            pool, name = address_cache
+            pool.last_slots = slot_mapping
+            key_cache, value_cache = pool.key_value(name)
+            triton_reshape_and_cache_flash(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+                block_addresses=kv_cache,
+            )
             return
         # Reshape the input keys and values and store them in the cache.
         if self._is_per_token_head_quant:

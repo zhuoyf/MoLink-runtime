@@ -56,6 +56,8 @@ def reshape_and_cache_kernel_flash(
     FP8_KV_CACHE: tl.constexpr,
     # tune parameters
     TILE_SIZE: tl.constexpr,
+    block_addresses_ptr=None,
+    USE_BLOCK_ADDRESSES: tl.constexpr = False,
 ):
     token_idx = tl.program_id(axis=0)
     slot_idx = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
@@ -65,6 +67,12 @@ def reshape_and_cache_kernel_flash(
 
     block_idx = slot_idx // block_size
     block_offset = slot_idx % block_size
+    if USE_BLOCK_ADDRESSES:
+        address = tl.load(block_addresses_ptr + block_idx)
+        value_delta = value_cache_ptr.to(tl.int64) - key_cache_ptr.to(tl.int64)
+        key_cache_ptr = address.to(key_cache_ptr.dtype)
+        value_cache_ptr = (address + value_delta).to(value_cache_ptr.dtype)
+        block_idx = 0
 
     tile_i = tl.program_id(axis=1)
     tile_offs = tl.arange(0, TILE_SIZE)
@@ -371,6 +379,7 @@ def triton_reshape_and_cache_flash(
     kv_cache_dtype: str,  # "auto", "fp8"
     k_scale: torch.Tensor,  # float32
     v_scale: torch.Tensor,  # float32
+    block_addresses: torch.Tensor | None = None,
 ):
     num_heads = key.shape[1]
     head_size = key.shape[2]
@@ -457,6 +466,8 @@ def triton_reshape_and_cache_flash(
         TILE_SIZE=TILE_SIZE,
         num_warps=num_warps,
         num_stages=num_stages,
+        block_addresses_ptr=block_addresses,
+        USE_BLOCK_ADDRESSES=block_addresses is not None,
     )
 
 

@@ -11,14 +11,16 @@ from transformers import LlamaConfig, LlamaForCausalLM
 parser = argparse.ArgumentParser()
 parser.add_argument("--output", required=True)
 parser.add_argument("--tokenizer", required=True)
+parser.add_argument("--hidden-size", type=int, default=128)
+parser.add_argument("--head-size", type=int, default=64)
 args = parser.parse_args()
 torch.manual_seed(123)
 config = LlamaConfig(
-    hidden_size=128,
-    intermediate_size=256,
+    hidden_size=args.hidden_size,
+    intermediate_size=2 * args.hidden_size,
     num_hidden_layers=10,
-    num_attention_heads=2,
-    num_key_value_heads=2,
+    num_attention_heads=args.hidden_size // args.head_size,
+    num_key_value_heads=args.hidden_size // args.head_size,
     vocab_size=32000,
     max_position_embeddings=512,
 )

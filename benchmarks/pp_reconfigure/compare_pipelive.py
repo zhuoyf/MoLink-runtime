@@ -1,0 +1,186 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Two-GPU multi-request continuity and synchronous/asynchronous comparison."""
+
+import argparse
+import json
+import threading
+import time
+from pathlib import Path
+
+from acceptance import read_json, request
+
+
+def generate(base, payload, ready=None, outputs=None, times=None):
+    outputs = outputs if outputs is not None else [[] for _ in payload["prompt"]]
+    with request(base, "/v1/completions", {**payload, "stream": True}) as response:
+        for line in response:
+            if not line.startswith(b"data: ") or b"[DONE]" in line:
+                continue
+            item = json.loads(line[6:])
+            if "error" in item:
+                raise RuntimeError(item["error"])
+            for choice in item["choices"]:
+                index = choice["index"]
+                ids = choice.get("token_ids") or []
+                outputs[index].extend(ids)
+                if times is not None and ids:
+                    times[index].extend([time.time()] * len(ids))
+            if ready is not None and all(len(tokens) >= 4 for tokens in outputs):
+                ready.set()
+    return outputs
+
+
+def trial(
+    base,
+    payload,
+    boundary,
+    mode,
+    expected,
+    resize=False,
+    verify_kv=False,
+):
+    ready = threading.Event()
+    tokens = [[] for _ in payload["prompt"]]
+    times = [[] for _ in tokens]
+    errors = []
+
+    def run():
+        try:
+            generate(base, payload, ready, tokens, times)
+        except BaseException as exc:
+            errors.append(str(exc))
+            ready.set()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    assert ready.wait(60), "multi-request generation did not start"
+    assert not errors, errors
+    resize_results = []
+    resize_states = []
+    if resize:
+        resize_states.append(
+            {"time": time.time(), **read_json(base, "/molink/monitor")}
+        )
+        for capacity in (48, 64):
+            resize_results.append(
+                read_json(base, "/molink/resize_kv", {"num_blocks": capacity})
+            )
+            state = {"time": time.time(), **read_json(base, "/molink/monitor")}
+            assert state["num_blocks"] == capacity
+            assert len(state["requests"]) == len(payload["prompt"])
+            assert all(r["num_preemptions"] == 0 for r in state["requests"].values())
+            resize_states.append(state)
+    result = read_json(
+        base,
+        "/molink/reconfigure",
+        {"boundary": boundary, "mode": mode, "verify_kv": verify_kv},
+    )
+    thread.join(180)
+    assert not thread.is_alive() and not errors, errors
+    (Path(result["log_dir"]) / "tokens.json").write_text(
+        json.dumps({"expected": expected, "actual": tokens}) + "\n"
+    )
+    assert tokens == expected, (
+        f"token continuity failure in {mode} boundary={boundary}; "
+        f"logs={result['log_dir']}"
+    )
+    records = [
+        json.loads(line)
+        for line in (Path(result["log_dir"]) / "state.log").read_text().splitlines()
+    ]
+    before, after = records[-2:]
+    active = {
+        key: value
+        for key, value in before["requests"].items()
+        if value["output_token_ids"]
+    }
+    assert len(active) == len(payload["prompt"]), (
+        f"expected multiple active requests, found {len(active)}"
+    )
+    for key, state in active.items():
+        assert after["requests"][key] == state
+        assert state["num_preemptions"] == 0
+    if mode == "async":
+        assert result["metrics"]["inference_steps_during_migration"] > 0
+    result["generated_tokens"] = [len(row) for row in tokens]
+    result["active_requests_at_commit"] = len(active)
+    result["max_stream_gap_ms"] = [
+        max((b - a) * 1000 for a, b in zip(row, row[1:])) for row in times
+    ]
+    result["resize_results"] = resize_results
+    result["resize_states"] = resize_states
+    result["stream_token_times"] = times
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", default="http://127.0.0.1:26020")
+    parser.add_argument("--model", default="molink-tiny")
+    parser.add_argument("--iterations", type=int, default=1)
+    parser.add_argument("--boundaries", type=int, nargs=2, default=[6, 8])
+    parser.add_argument("--verify-kv", action="store_true")
+    parser.add_argument(
+        "--output",
+        default="/workspace/molink-reconfiguration-results/pipelive/comparison.json",
+    )
+    args = parser.parse_args()
+    payload = {
+        "model": args.model,
+        "prompt": [
+            "The capital of France is " * 8,
+            "Explain the water cycle. " * 8,
+            "A story about mountains. " * 8,
+        ],
+        "max_tokens": 192,
+        "temperature": 0,
+        "seed": 42,
+        "ignore_eos": True,
+        "return_token_ids": True,
+    }
+    generate(args.url, {**payload, "max_tokens": 1})
+    expected = generate(args.url, payload)
+    assert all(len(tokens) == payload["max_tokens"] for tokens in expected)
+    results = []
+    output = Path(args.output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    for iteration in range(args.iterations):
+        for mode in ("sync", "async"):
+            for boundary in args.boundaries:
+                result = trial(
+                    args.url,
+                    payload,
+                    boundary,
+                    mode,
+                    expected,
+                    resize=iteration == 0
+                    and mode == "async"
+                    and boundary == args.boundaries[0],
+                    verify_kv=args.verify_kv,
+                )
+                results.append(result)
+                output.write_text(json.dumps({"results": results}, indent=2) + "\n")
+                print(
+                    json.dumps(
+                        {
+                            key: result[key]
+                            for key in (
+                                "mode",
+                                "boundary",
+                                "total_ms",
+                                "pause_ms",
+                                "metrics",
+                                "max_stream_gap_ms",
+                            )
+                        }
+                    ),
+                    flush=True,
+                )
+    output.write_text(
+        json.dumps({"status": "passed", "results": results}, indent=2) + "\n"
+    )
+
+
+if __name__ == "__main__":
+    main()

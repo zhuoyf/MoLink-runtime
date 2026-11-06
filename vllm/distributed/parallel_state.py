@@ -46,6 +46,7 @@ import vllm.envs as envs
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
+from vllm.distributed.pp_reconfigure.communication import serialize_inference_nccl
 from vllm.distributed.utils import (
     StatelessProcessGroup,
     get_cached_tcp_store_client,
@@ -699,6 +700,7 @@ class GroupCoordinator:
         with torch.cuda.stream(stream), maybe_ca_context, maybe_aiter_context:
             yield graph_capture_context
 
+    @serialize_inference_nccl
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """
         User-facing all-reduce function before we actually call the
@@ -728,6 +730,7 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_)
 
+    @serialize_inference_nccl
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
@@ -749,6 +752,7 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gather(input_, dim)
 
+    @serialize_inference_nccl
     def all_gatherv(
         self,
         input_: torch.Tensor | list[torch.Tensor],
@@ -759,6 +763,7 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_gatherv(input_, dim, sizes)
 
+    @serialize_inference_nccl
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
@@ -775,6 +780,7 @@ class GroupCoordinator:
         else:
             return self._reduce_scatter_out_place(input_, dim)
 
+    @serialize_inference_nccl
     def reduce_scatterv(
         self, input_: torch.Tensor, dim: int = -1, sizes: list[int] | None = None
     ) -> torch.Tensor:
@@ -803,6 +809,7 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.gather(input_, dst, dim)
 
+    @serialize_inference_nccl
     def broadcast(self, input_: torch.Tensor, src: int = 0):
         """Broadcast the input tensor.
         NOTE: `src` is the local rank of the source rank.
@@ -1045,6 +1052,7 @@ class GroupCoordinator:
             use_all_gather = all_gather_tensors.get(key, use_all_gather)
         return use_all_gather
 
+    @serialize_inference_nccl
     def send_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any],
@@ -1126,6 +1134,7 @@ class GroupCoordinator:
             handles[0].wait()
             pending.popleft()
 
+    @serialize_inference_nccl
     def isend_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any],
@@ -1216,6 +1225,7 @@ class GroupCoordinator:
 
         return handles
 
+    @serialize_inference_nccl
     def recv_tensor_dict(
         self,
         src: int | None = None,
@@ -1254,6 +1264,7 @@ class GroupCoordinator:
             fn()
         return tensor_dict
 
+    @serialize_inference_nccl
     def irecv_tensor_dict(
         self,
         src: int | None = None,
@@ -1355,6 +1366,7 @@ class GroupCoordinator:
         """
         torch.distributed.barrier(group=self.cpu_group)
 
+    @serialize_inference_nccl
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         """Sends a tensor to the destination rank in a blocking way"""
         """NOTE: `dst` is the local rank of the destination rank."""
@@ -1362,6 +1374,7 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         self.device_communicator.send(tensor, dst)
 
+    @serialize_inference_nccl
     def recv(
         self, size: torch.Size, dtype: torch.dtype, src: int | None = None
     ) -> torch.Tensor:

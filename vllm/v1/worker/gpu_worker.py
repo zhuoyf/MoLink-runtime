@@ -48,6 +48,7 @@ from vllm.distributed.parallel_state import (
     get_pp_group,
     get_tp_group,
 )
+from vllm.distributed.pp_reconfigure.patching import live_sampling, live_step
 from vllm.distributed.weight_transfer import (
     WeightTransferEngine,
     WeightTransferEngineFactory,
@@ -149,7 +150,7 @@ _PP_TRACE_F = None
 # worker's first step with scheduled tokens instead of step numbers (step
 # rates differ ~3x between schedulers, so time windows compare systems).
 _PROF_WIN = os.environ.get("HETVLLM_PROF_STEPS")
-_PROF_TIME = bool(_PROF_WIN) and _PROF_WIN.startswith("t")
+_PROF_TIME = _PROF_WIN is not None and _PROF_WIN.startswith("t")
 _PROF_STEPS = (
     tuple(float(x) for x in _PROF_WIN.lstrip("t").split(":")) if _PROF_WIN else None
 )
@@ -266,7 +267,7 @@ class Worker(WorkerBase):
         self._pp_rank_cached = -1
         self._pp_step_counter = 0
         # hetvllm auto profiler window state
-        self._prof_n = 0
+        self._prof_n = 0.0
         self._prof_on = False
         self._prof_done = False
         self._prof_t0: float | None = None
@@ -407,6 +408,22 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
+        if os.environ.get("HETVLLM_PIPELIVE") == "1" and (
+            not self.use_v2_model_runner
+            or not self.model_config.enforce_eager
+            or self.vllm_config.attention_config.backend is None
+            or self.vllm_config.attention_config.backend.name != "TRITON_ATTN"
+            or os.environ.get("HETVLLM_PP_LINK", "0") != "0"
+            or (
+                self.parallel_config.pipeline_parallel_size,
+                self.parallel_config.tensor_parallel_size,
+                self.parallel_config.data_parallel_size,
+            )
+            != (2, 1, 1)
+        ):
+            raise ValueError(
+                "PipeLive requires eager MRv2, TRITON_ATTN, NCCL PP=2/TP=DP=1"
+            )
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
@@ -795,6 +812,12 @@ class Worker(WorkerBase):
                 tag="kv_cache"
             ),
         )
+
+        if os.environ.get("HETVLLM_PIPELIVE") == "1":
+            from vllm.distributed.pp_reconfigure.live import LiveLayerMigration
+
+            self._pipelive = LiveLayerMigration(self)
+            self._molink_migration = self._pipelive
 
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
@@ -1190,6 +1213,7 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     @with_gpu_sync_check
+    @live_sampling
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
@@ -1204,6 +1228,7 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     @with_gpu_sync_check
+    @live_step
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
@@ -1387,9 +1412,13 @@ class Worker(WorkerBase):
             _monitor = self._molink_monitor
             _monitor_events = _monitor.begin()
         with self.annotate_profile(scheduler_output):
+            if live := getattr(self, "_pipelive", None):
+                live.begin_compute()
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
+            if live is not None:
+                live.end_compute()
             if _monitor is not None:
                 _monitor.end(
                     _monitor_events, scheduler_output.total_num_scheduled_tokens
@@ -1566,7 +1595,8 @@ class Worker(WorkerBase):
 
         if not hasattr(self, "_molink_monitor"):
             self._molink_monitor = StageMonitor()
-        with torch.cuda.device(self.device):
+        assert self.device is not None
+        with torch.accelerator.device_index(self.device.index):
             return self._molink_monitor.snapshot(self)
 
     def molink_resource_state(self):

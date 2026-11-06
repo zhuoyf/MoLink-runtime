@@ -106,6 +106,9 @@ class StageMonitor:
         runner = worker.model_runner
         config = runner.kv_cache_config
         capacity = sum(t.size for t in config.kv_cache_tensors[:1])
+        if runner.kv_caches and hasattr(runner.kv_caches[0], "_pipelive"):
+            pools = {cache._pipelive[0] for cache in runner.kv_caches}
+            capacity = sum(pool.allocated_bytes for pool in pools)
         decoder = getattr(runner.get_model(), "model", None)
         properties = torch.cuda.get_device_properties(worker.device)
         total = properties.total_memory
@@ -136,8 +139,8 @@ class StageMonitor:
             "kv_state_time": kv_state_time,
             "total_memory_bytes": total,
             **memory_metrics(
-                torch.cuda.memory_allocated(worker.device),
-                torch.cuda.memory_reserved(worker.device),
+                torch.accelerator.memory_allocated(worker.device),
+                torch.accelerator.memory_reserved(worker.device),
                 capacity,
                 capacity * used_blocks // config.num_blocks,
                 total,

@@ -1071,9 +1071,13 @@ class EngineCore:
             self._molink_resource_next = time.monotonic() + interval
 
     def molink_migrate(self, action, boundary=None, log_dir=None):
-        if action != "describe" and (
-            self.scheduler.pause_state != PauseState.PAUSED_ALL or self.batch_queue
-        ):
+        if action not in (
+            "describe",
+            "prepare_live",
+            "start_live",
+            "progress_live",
+            "prepared_live",
+        ) and (self.scheduler.pause_state != PauseState.PAUSED_ALL or self.batch_queue):
             raise ValueError("migration requires a completed keep pause")
         results: list[dict[str, Any]] = self.collective_rpc(
             "molink_migrate", args=(action, boundary, log_dir)
@@ -1086,6 +1090,43 @@ class EngineCore:
             os.environ["VLLM_PP_LAYER_PARTITION"] = partition
             envs.VLLM_PP_LAYER_PARTITION = partition
         return results
+
+    def molink_resize_kv(self, capacity):
+        from vllm.distributed.pp_reconfigure.control import validate_workers
+        from vllm.distributed.pp_reconfigure.resize import (
+            commit_pool_resize,
+            plan_resize,
+        )
+        from vllm.v1.core.sched.scheduler import Scheduler
+
+        if os.environ.get("HETVLLM_PIPELIVE") != "1":
+            raise ValueError("KV resizing requires HETVLLM_PIPELIVE=1 at startup")
+        scheduler = cast(Scheduler, self.scheduler)
+        manager = scheduler.kv_cache_manager
+        pool = manager.block_pool
+        plan = plan_resize(pool, capacity)
+        try:
+            results: list[dict[str, Any]] = self.collective_rpc(
+                "molink_migrate", args=("prepare_resize_live", plan, None)
+            )
+            validate_workers(results)
+        except Exception:
+            cleanup: list[dict[str, Any]] = self.collective_rpc(
+                "molink_migrate", args=("rollback_resize_live", None, None)
+            )
+            validate_workers(cleanup)
+            raise
+        commit_pool_resize(pool, plan)
+        results = self.collective_rpc(
+            "molink_migrate", args=("commit_resize_live", None, None)
+        )
+        if any(not worker["ok"] for worker in results):
+            scheduler.set_pause_state(PauseState.PAUSED_ALL)
+        validate_workers(results)
+        manager.kv_cache_config.num_blocks = capacity
+        manager.watermark_blocks = int(scheduler.scheduler_config.watermark * capacity)
+        scheduler.cache_config.num_gpu_blocks = capacity
+        return {"plan": plan, "workers": results}
 
     def get_weight_version(self) -> str:
         """Return the latest committed weight version."""
