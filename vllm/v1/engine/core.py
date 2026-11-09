@@ -1075,10 +1075,25 @@ class EngineCore:
             "describe",
             "prepare_live",
             "start_live",
+            "start_history",
             "progress_live",
             "prepared_live",
+            "start_cleanup",
+            "cleanup_progress",
         ) and (self.scheduler.pause_state != PauseState.PAUSED_ALL or self.batch_queue):
             raise ValueError("migration requires a completed keep pause")
+        if (
+            action in ("start_live", "start_history", "load_and_transfer")
+            and os.environ.get("HETVLLM_PIPELIVE") == "1"
+        ):
+            from vllm.distributed.pp_reconfigure.resize import required_migration_blocks
+            from vllm.v1.core.sched.scheduler import Scheduler
+
+            pool = cast(Scheduler, self.scheduler).kv_cache_manager.block_pool
+            boundary = {
+                "block_ids": required_migration_blocks(pool),
+                "generations": [b.allocation_generation for b in pool.blocks],
+            }
         results: list[dict[str, Any]] = self.collective_rpc(
             "molink_migrate", args=(action, boundary, log_dir)
         )

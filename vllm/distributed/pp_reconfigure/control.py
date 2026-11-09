@@ -48,8 +48,10 @@ class ReconfigurationController:
         )
 
     async def reconfigure(self, boundary, mode="sync", verify_kv=False):
-        if mode not in ("sync", "async"):
-            raise ReconfigurationValidationError("migration mode must be sync or async")
+        if mode not in ("sync", "async", "async_no_patching"):
+            raise ReconfigurationValidationError(
+                "migration mode must be sync, async, or async_no_patching"
+            )
         if self.lock.locked():
             raise ReconfigurationValidationError("a reconfiguration is already running")
         async with self.lock:
@@ -109,7 +111,7 @@ class ReconfigurationController:
                                 "molink_resize_kv", shrink
                             ),
                         )
-                if mode == "async":
+                if mode != "sync":
                     if not all(w.get("pipelive") for w in descriptions):
                         raise ReconfigurationValidationError(
                             "async migration requires HETVLLM_PIPELIVE=1 at startup"
@@ -123,7 +125,14 @@ class ReconfigurationController:
                                 "background KV allocation did not complete"
                             )
                         await asyncio.sleep(0.01)
-                    await phase("start_live", lambda: rpc("start_live"))
+                    await phase(
+                        "start_live",
+                        lambda: rpc(
+                            "start_history"
+                            if mode == "async_no_patching"
+                            else "start_live"
+                        ),
+                    )
                     deadline = time.monotonic() + 180
                     while True:
                         progress = await rpc("progress_live")
@@ -132,9 +141,11 @@ class ReconfigurationController:
                             w for w in progress if w["stage"] != w["source"]
                         )
                         write_event(directory, "progress", workers=progress)
-                        if (
-                            all(w["full_done"] and w["weights_ready"] for w in progress)
-                            and source["scheduled"] - destination["applied"] < 50
+                        if all(
+                            w["full_done"] and w["weights_ready"] for w in progress
+                        ) and (
+                            mode == "async_no_patching"
+                            or source["scheduled"] - destination["applied"] < 50
                         ):
                             break
                         if time.monotonic() >= deadline:
@@ -153,7 +164,7 @@ class ReconfigurationController:
                 if before["batch_queue_depth"]:
                     raise RuntimeError("pipeline batches did not drain")
                 write_event(directory, "state", event="before", **before)
-                if mode == "async":
+                if mode != "sync":
                     live_stats = await phase("sync_live", lambda: rpc("sync_live"))
                     parallel = live_stats
                 else:
@@ -174,6 +185,8 @@ class ReconfigurationController:
                         or source["dirty_slots"]
                         or source["scheduled"] != source["applied"]
                         or source["scheduled"] != destination["applied"]
+                        or source.get("patch_version")
+                        != destination.get("patch_version")
                     ):
                         raise RuntimeError("required KV updates remain before commit")
                 verification = None
@@ -194,19 +207,43 @@ class ReconfigurationController:
                 write_event(directory, "state", event="after", **after)
                 # After release begins, rollback is no longer safe on every rank.
                 finalized = True
-                await phase("finalize", lambda: rpc("finalize"))
-                if resize_restore is not None:
-                    current = await self.state()
-                    if resize_restore != current.get("num_blocks", resize_restore):
-                        await phase(
-                            "resize_after",
-                            lambda: self.engine.engine_core.call_utility_async(
-                                "molink_resize_kv", resize_restore
-                            ),
-                        )
+                finalized_workers = await phase("finalize", lambda: rpc("finalize"))
+                deferred_cleanup = any(
+                    w.get("cleanup_pending") for w in finalized_workers
+                )
+
+                async def restore_capacity():
+                    if resize_restore is not None:
+                        current = await self.state()
+                        if resize_restore != current.get("num_blocks", resize_restore):
+                            await phase(
+                                "resize_after",
+                                lambda: self.engine.engine_core.call_utility_async(
+                                    "molink_resize_kv", resize_restore
+                                ),
+                            )
+
+                if not deferred_cleanup:
+                    await restore_capacity()
                 await phase("resume", self.engine.resume_generation)
                 paused = False
                 pause_ms = (time.perf_counter() - pause_started) * 1000
+                if deferred_cleanup:
+
+                    async def cleanup():
+                        await rpc("start_cleanup")
+                        deadline = time.monotonic() + 60
+                        while not all(
+                            w["cleanup_done"] for w in await rpc("cleanup_progress")
+                        ):
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError(
+                                    "post-resume cleanup did not complete"
+                                )
+                            await asyncio.sleep(0.01)
+
+                    await phase("cleanup", cleanup)
+                    await restore_capacity()
                 total_ms = (time.perf_counter() - transaction_started) * 1000
                 result = {
                     "status": "resumed",
@@ -246,7 +283,7 @@ class ReconfigurationController:
                 return result
             except BaseException as exc:
                 recovery = "unchanged"
-                if background_started and not paused:
+                if background_started and not paused and not finalized:
                     try:
                         pause_attempted = True
                         await self.engine.pause_generation(
@@ -265,6 +302,12 @@ class ReconfigurationController:
                         recovery = "rolled_back_and_resumed"
                     except Exception as recovery_error:
                         recovery = f"paused: {recovery_error}"
+                elif finalized and not paused:
+                    recovery = (
+                        "committed; service paused after finalization failure"
+                        if await self.engine.is_paused()
+                        else "committed_and_resumed; post-resume finalization failed"
+                    )
                 elif pause_attempted:
                     recovery = "pause state requires inspection"
                 write_event(

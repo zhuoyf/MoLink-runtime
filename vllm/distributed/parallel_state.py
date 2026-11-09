@@ -1225,7 +1225,6 @@ class GroupCoordinator:
 
         return handles
 
-    @serialize_inference_nccl
     def recv_tensor_dict(
         self,
         src: int | None = None,
@@ -1264,7 +1263,6 @@ class GroupCoordinator:
             fn()
         return tensor_dict
 
-    @serialize_inference_nccl
     def irecv_tensor_dict(
         self,
         src: int | None = None,
@@ -1297,15 +1295,28 @@ class GroupCoordinator:
             )
             return sync_tensor_dict, [], []
 
+        # CPU metadata can wait for the peer's forward pass. Reserve NCCL only
+        # after it arrives so reverse migration can run during that computation.
+        recv_metadata_list = self.recv_object(src=src)
+        return self._irecv_tensor_dict_payload(
+            recv_metadata_list, src, all_gather_group, all_gather_tensors
+        )
+
+    @serialize_inference_nccl
+    def _irecv_tensor_dict_payload(
+        self,
+        recv_metadata_list: list,
+        src: int,
+        all_gather_group: "GroupCoordinator | None",
+        all_gather_tensors: dict[str, bool] | None,
+    ) -> tuple[dict[str, Any], list[Handle], list[Callable[[], None]]]:
         all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
         all_gather_rank = (
             0 if all_gather_group is None else all_gather_group.rank_in_group
         )
-
         group = self.device_group
         metadata_group = self.cpu_group
 
-        recv_metadata_list = self.recv_object(src=src)
         tensor_dict: dict[str, Any] = {}
         handles: list[Handle] = []
         postprocess: list[Callable[[], None]] = []

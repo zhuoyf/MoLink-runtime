@@ -3,9 +3,11 @@
 """PipeLive worker primitives, retaining MoLink's layer binding and recovery."""
 
 import copy
+import gc
 import hashlib
 import os
 import threading
+import time
 
 import torch
 
@@ -15,7 +17,11 @@ from vllm.distributed.pp_reconfigure.cache import StackedKVCache
 from vllm.distributed.pp_reconfigure.communication import MigrationChannel
 from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
 from vllm.distributed.pp_reconfigure.monitor import write_event
-from vllm.distributed.pp_reconfigure.patching import DirtyBitmap, copy_slots
+from vllm.distributed.pp_reconfigure.patching import (
+    DirtyBitmap,
+    PatchLifecycle,
+    copy_slots,
+)
 from vllm.distributed.pp_reconfigure.worker import (
     LayerMigration,
     Prepared,
@@ -42,11 +48,15 @@ class LiveLayerMigration(LayerMigration):
         self.preparing = False
         self.resize_pending: tuple[dict, set[StackedKVCache]] | None = None
         self.error = None
+        self.retired = None
+        self.cleanup_thread = None
+        self.cleanup_error = None
         self.anchor = torch.cuda.Event(enable_timing=True)
         self.anchor.record()
         self.anchor.synchronize()
 
     def describe(self, boundary):
+        self._wait_cleanup()
         result = super().describe(boundary)
         k = int(os.environ.get("HETVLLM_PIPELIVE_STACK", "2"))
         if boundary % k or result["old_boundary"] % k:
@@ -134,8 +144,8 @@ class LiveLayerMigration(LayerMigration):
             )
         return self.weight_result
 
-    def load_and_transfer(self, log_dir=None):
-        self.start_live(log_dir)
+    def load_and_transfer(self, log_dir=None, block_ids=None, generations=None):
+        self.start_live(log_dir, block_ids=block_ids, generations=generations)
         result = self.sync_live()
         return {
             "ok": True,
@@ -149,6 +159,13 @@ class LiveLayerMigration(LayerMigration):
         description = self.describe(boundary)
         if self.prepared is not None or self.preparing:
             raise ValueError("a migration is already prepared")
+        old_boundary = description["old_boundary"]
+        source = 0 if boundary < old_boundary else 1
+        if self.stage != source:
+            self.weight_cache.prefetch(
+                self.config,
+                range(min(boundary, old_boundary), max(boundary, old_boundary)),
+            )
         self.error = None
         self.preparing = True
         self.last_write = torch.cuda.Event()
@@ -255,6 +272,7 @@ class LiveLayerMigration(LayerMigration):
         self.full_done = False
         self.applied = 0
         self.bytes_sent = 0
+        self.transferred_slots = set()
         self.error = None
         self.finish = threading.Event()
         self.compute_intervals = []
@@ -270,22 +288,33 @@ class LiveLayerMigration(LayerMigration):
         )
         return description
 
-    def start_live(self, log_dir):
+    def start_live(self, log_dir, block_ids=None, generations=None, patching=True):
         tx = self._transaction()
+        pool, _ = next(iter(tx.old_kv.values()))._pipelive
+        self.history_block_ids = sorted(pool.stacks if block_ids is None else block_ids)
+        if not set(self.history_block_ids) <= pool.stacks.keys():
+            raise ValueError("history block manifest references unallocated KV")
+        self.lifecycle = PatchLifecycle(
+            generations
+            if generations is not None
+            else [0] * (len(self.bitmap.bits) // pool.spec.block_size)
+        )
+        self.send_version = 0
+        self.patching = patching
+        self.stale_slots = 0
         self.anchor.record()
         self.anchor.synchronize()
         self.last_write = torch.cuda.Event()
         self.last_write.record()
         self.log_dir = log_dir
         self.channel.rejections = 0
+        self.channel.timings_ms.clear()
         self.gpu_profiler = None
-        if (
-            os.environ.get("HETVLLM_PIPELIVE_PROFILE") == "1"
-            and self.stage == tx.source
-        ):
-            self.gpu_profiler = torch.profiler.profile(
-                activities=[torch.profiler.ProfilerActivity.CUDA]
-            )
+        if os.environ.get("HETVLLM_PIPELIVE_PROFILE") == "1":
+            activities = [torch.profiler.ProfilerActivity.CUDA]
+            if os.environ.get("HETVLLM_PIPELIVE_PROFILE_CPU") == "1":
+                activities.append(torch.profiler.ProfilerActivity.CPU)
+            self.gpu_profiler = torch.profiler.profile(activities=activities)
             self.gpu_profiler.start()
         self.active = True
         self.weights_thread = threading.Thread(
@@ -298,7 +327,12 @@ class LiveLayerMigration(LayerMigration):
         )
         self.weights_thread.start()
         self.kv_thread.start()
-        return {"started": True, "source": tx.source}
+        return {
+            "started": True,
+            "source": tx.source,
+            "history_block_ids": self.history_block_ids,
+            "allocated_blocks": len(pool.stacks),
+        }
 
     def _run(self, operation):
         try:
@@ -327,6 +361,28 @@ class LiveLayerMigration(LayerMigration):
             self.compute_events[1].record()
             self.compute_intervals.append(self.compute_events)
             self.compute_events = None
+
+    def before_step(self, scheduler_output):
+        generations = scheduler_output.pipelive_block_generations
+        if generations is None:
+            raise ValueError("missing scheduler block generations during migration")
+        changed = self.lifecycle.observe(generations)
+        tx = self._transaction()
+        if changed and self.log_dir:
+            write_event(
+                self.log_dir,
+                "generation",
+                stage=self.stage,
+                blocks=changed,
+                generations=[generations[b] for b in changed],
+            )
+        if changed and self.stage == tx.source:
+            block_size = tx.old_config.kv_cache_groups[0].kv_cache_spec.block_size
+            # Refresh the whole reused block, including untouched tail slots.
+            self.bitmap.mark(
+                [b * block_size + t for b in changed for t in range(block_size)],
+                advance=False,
+            )
 
     def after_step(self, scheduler_output):
         tx = self._transaction()
@@ -364,57 +420,79 @@ class LiveLayerMigration(LayerMigration):
             * spec.head_size
             * torch.empty((), dtype=spec.dtype).element_size()
         )
-        chunk_slots = max(1, min(16384, (16 << 20) // slot_bytes))
+        names = [f"model.layers.{i}.self_attn.attn" for i in tx.moving]
+        chunk_slots = max(1, min(16384, (16 << 20) // (slot_bytes * len(names))))
         chunks = [
             slots[i : i + chunk_slots] for i in range(0, len(slots), chunk_slots)
         ] or [[]]
-        for layer_index in tx.moving:
-            name = f"model.layers.{layer_index}.self_attn.attn"
-            for index, chunk in enumerate(chunks):
-                with self.cache_lock, torch.cuda.stream(self.channel.stream):
-                    if self.last_write is not None:
-                        self.channel.stream.wait_event(self.last_write)
-                    payload = copy_slots(tx.old_kv[name], chunk)
-                    self.gathered = torch.cuda.Event()
-                    self.gathered.record()
-                metadata = {
-                    "layer": name,
-                    "slots": chunk,
-                    "watermark": watermark,
-                    "last": layer_index == tx.moving[-1] and index == len(chunks) - 1,
-                    "full": full,
-                    "shape": list(payload.shape),
-                    "dtype": str(payload.dtype).removeprefix("torch."),
-                }
-                if self.log_dir:
-                    write_event(
-                        self.log_dir,
-                        "patch_submit",
-                        stage=self.stage,
-                        slots=len(chunk),
-                        watermark=watermark,
-                        full=full,
-                        last=metadata["last"],
-                        layer=name,
-                    )
-                events = self.channel.send(payload, metadata)
-                self.communication_intervals.append(events)
-                if not full and chunk:
-                    self.patch_intervals.append(events)
-                self.bytes_sent += payload.numel() * payload.element_size()
-                if self.log_dir:
-                    write_event(
-                        self.log_dir,
-                        "patch",
-                        event="nccl_complete_and_applied",
-                        stage=self.stage,
-                        slots=len(chunk),
-                        bytes=payload.numel() * payload.element_size(),
-                        watermark=watermark,
-                        full=full,
-                        last=metadata["last"],
-                    )
+        for index, chunk in enumerate(chunks):
+            gather_started = time.perf_counter()
+            with self.cache_lock, torch.cuda.stream(self.channel.stream):
+                acquired = time.perf_counter()
+                self.channel.timings_ms["gather_lock_and_stream_entry"] += (
+                    acquired - gather_started
+                ) * 1000
+                if self.last_write is not None:
+                    self.channel.stream.wait_event(self.last_write)
+                # Snapshot all moving layers before allowing another KV writer.
+                payload = torch.stack(
+                    [copy_slots(tx.old_kv[name], chunk) for name in names]
+                )
+                self.gathered = torch.cuda.Event()
+                self.gathered.record()
+                generations = [
+                    (block, self.lifecycle.generations[block])
+                    for block in sorted({slot // spec.block_size for slot in chunk})
+                ]
+                self.channel.timings_ms["gather_enqueue"] += (
+                    time.perf_counter() - acquired
+                ) * 1000
+            self.send_version += 1
+            metadata = {
+                "transaction": self.log_dir,
+                "version": self.send_version,
+                "generations": generations,
+                "layers": names,
+                "slots": chunk,
+                "watermark": watermark,
+                "last": index == len(chunks) - 1,
+                "full": full,
+                "shape": list(payload.shape),
+                "dtype": str(payload.dtype).removeprefix("torch."),
+            }
+            if self.log_dir:
+                write_event(
+                    self.log_dir,
+                    "patch_submit",
+                    stage=self.stage,
+                    slots=len(chunk),
+                    watermark=watermark,
+                    full=full,
+                    last=metadata["last"],
+                    layers=names,
+                    version=self.send_version,
+                    generations=generations,
+                )
+            events = self.channel.send(payload, metadata)
+            self.communication_intervals.append(events)
+            if not full and chunk:
+                self.patch_intervals.append(events)
+            self.bytes_sent += payload.numel() * payload.element_size()
+            if self.log_dir:
+                write_event(
+                    self.log_dir,
+                    "patch",
+                    event="nccl_complete_and_applied",
+                    stage=self.stage,
+                    slots=len(chunk),
+                    bytes=payload.numel() * payload.element_size(),
+                    watermark=watermark,
+                    full=full,
+                    last=metadata["last"],
+                    layers=names,
+                )
         self.applied = watermark
+        self.transferred_slots.update(slots)
         self.full_done |= full
         self.patch_rounds += bool(slots) and not full
 
@@ -424,10 +502,12 @@ class LiveLayerMigration(LayerMigration):
         block_size = pool.spec.block_size
         slots = [
             block * block_size + token
-            for block in sorted(pool.stacks)
+            for block in self.history_block_ids
             for token in range(block_size)
         ]
         self._send_snapshot(slots, 0, full=True)
+        if not self.patching:
+            self.finish.wait()
         while True:
             with self.cache_lock:
                 slots, watermark = self.bitmap.drain()
@@ -446,8 +526,33 @@ class LiveLayerMigration(LayerMigration):
         tx = self._transaction()
 
         def apply(payload, metadata):
-            copy_slots(tx.new_kv[metadata["layer"]], metadata["slots"], payload)
-            self.channel.stream.synchronize()
+            if metadata["transaction"] != self.log_dir:
+                raise ValueError("KV patch belongs to another transaction")
+            block_size = tx.old_config.kv_cache_groups[0].kv_cache_spec.block_size
+            with self.lifecycle.lock:
+                valid = self.lifecycle.accept(
+                    metadata["version"], metadata["generations"]
+                )
+                indices = [
+                    i
+                    for i, slot in enumerate(metadata["slots"])
+                    if slot // block_size in valid
+                ]
+                slots = [metadata["slots"][i] for i in indices]
+                if len(indices) != len(metadata["slots"]):
+                    self.stale_slots += len(metadata["slots"]) - len(indices)
+                    selection = torch.tensor(
+                        indices, device=payload.device, dtype=torch.int64
+                    )
+                    payload_to_apply = payload.index_select(1, selection)
+                else:
+                    payload_to_apply = payload
+                for name, layer_payload in zip(
+                    metadata["layers"], payload_to_apply, strict=True
+                ):
+                    copy_slots(tx.new_kv[name], slots, layer_payload)
+                self.channel.stream.synchronize()
+            self.transferred_slots.update(metadata["slots"])
             self.bytes_sent += payload.numel() * payload.element_size()
             if self.log_dir:
                 write_event(
@@ -458,7 +563,9 @@ class LiveLayerMigration(LayerMigration):
                     watermark=metadata["watermark"],
                     full=metadata["full"],
                     last=metadata["last"],
-                    layer=metadata["layer"],
+                    layers=metadata["layers"],
+                    version=metadata["version"],
+                    stale_slots=self.stale_slots,
                 )
             if metadata["last"]:
                 self.patch_rounds += bool(metadata["slots"]) and not metadata["full"]
@@ -484,6 +591,10 @@ class LiveLayerMigration(LayerMigration):
             "steps": self.step_count,
             "bytes": self.bytes_sent,
             "source": tx.source,
+            "patch_version": (
+                self.send_version if self.stage == tx.source else self.lifecycle.version
+            ),
+            "stale_slots": self.stale_slots,
         }
 
     def verify_live(self):
@@ -491,24 +602,23 @@ class LiveLayerMigration(LayerMigration):
         if not tx.kv_ready:
             raise ValueError("KV verification requires final synchronization")
         digest = hashlib.sha256()
+        slots = sorted(self.transferred_slots)
+        digest.update(str(slots).encode())
         caches = tx.old_kv if self.stage == tx.source else tx.new_kv
         for index in tx.moving:
             name = f"model.layers.{index}.self_attn.attn"
-            pool, _ = caches[name]._pipelive
-            for block_id in sorted(pool.stacks):
-                block = pool.block(name, block_id).contiguous().view(torch.uint8)
-                digest.update(block.cpu().numpy().tobytes())
-        return {"kv_digest": digest.hexdigest()}
+            for start in range(0, len(slots), 1024):
+                payload = copy_slots(caches[name], slots[start : start + 1024])
+                digest.update(payload.view(torch.uint8).cpu().numpy().tobytes())
+        return {"kv_digest": digest.hexdigest(), "verified_slots": len(slots)}
 
-    def sync_live(self):
+    def _quiesce_live(self):
         self.finish.set()
         for thread in (self.kv_thread, self.weights_thread):
             thread.join(timeout=60)
             if thread.is_alive():
                 raise TimeoutError("PipeLive background thread did not quiesce")
         self.active = False
-        if self.error:
-            raise RuntimeError(self.error)
         torch.accelerator.synchronize(self.worker.device)
         gpu_trace = None
         if self.gpu_profiler is not None:
@@ -516,6 +626,10 @@ class LiveLayerMigration(LayerMigration):
             gpu_trace = f"{self.log_dir}/gpu-stage{self.stage}.json"
             self.gpu_profiler.export_chrome_trace(gpu_trace)
             self.gpu_profiler = None
+        return gpu_trace
+
+    def sync_live(self):
+        gpu_trace = self._quiesce_live()
         result = self.progress_live()
         result.update(
             gpu_trace=gpu_trace,
@@ -532,6 +646,7 @@ class LiveLayerMigration(LayerMigration):
                 for a, b in self.patch_intervals
             ],
             handshake_rejections=self.channel.rejections,
+            communication_host_ms=dict(self.channel.timings_ms),
         )
         return result
 
@@ -541,10 +656,11 @@ class LiveLayerMigration(LayerMigration):
             if self.prepare_thread.is_alive():
                 raise TimeoutError("PipeLive preparation did not quiesce")
         if self.active:
-            self.sync_live()
+            self._quiesce_live()
         return super().rollback()
 
     def prepare_resize_live(self, plan):
+        self._wait_cleanup()
         if self.prepared is not None:
             raise ValueError("cannot resize during KV migration")
         pools = {cache._pipelive[0] for cache in self.runner.kv_caches}
@@ -597,10 +713,75 @@ class LiveLayerMigration(LayerMigration):
         tx = self._transaction()
         if not tx.committed:
             raise ValueError("cannot finalize before commit")
-        if self.stage == tx.source:
-            names = [f"model.layers.{i}.self_attn.attn" for i in tx.moving]
-            pools = {tx.old_kv[name]._pipelive[0] for name in names}
-            for pool in pools:
-                pool.retire_layers(names)
-        del tx
-        return super().finalize()
+        self.retired = tx
+        self.prepared = None
+        if os.environ.get("HETVLLM_PIPELIVE_DEFER_CLEANUP", "1") == "0":
+            del tx
+            self._cleanup_retired()
+            if self.cleanup_error:
+                raise RuntimeError(self.cleanup_error)
+            return {"finalized": True, "cleanup_pending": False}
+        return {"finalized": True, "cleanup_pending": True}
+
+    def start_cleanup(self):
+        if self.cleanup_thread is not None and self.cleanup_thread.is_alive():
+            raise ValueError("previous cleanup is still running")
+        self.cleanup_error = None
+        self.cleanup_thread = threading.Thread(
+            target=self._cleanup_retired, daemon=True
+        )
+        self.cleanup_thread.start()
+        return {"cleanup_started": True}
+
+    def _cleanup_retired(self):
+        try:
+            with (
+                torch.accelerator.device_index(self.worker.device.index),
+                torch.inference_mode(),
+            ):
+                started = time.perf_counter()
+                if self.log_dir:
+                    write_event(
+                        self.log_dir, "cleanup_worker", event="begin", stage=self.stage
+                    )
+                tx = self.retired
+                if tx is not None:
+                    if self.stage == tx.source:
+                        names = [f"model.layers.{i}.self_attn.attn" for i in tx.moving]
+                        pools = {tx.old_kv[name]._pipelive[0] for name in names}
+                        for pool in pools:
+                            pool.retire_layers(names)
+                    tx.transport.close()
+                    self.retired = None
+                    del tx
+                    gc.unfreeze()
+                    gc.collect()
+                    torch.accelerator.empty_cache()
+                if self.log_dir:
+                    write_event(
+                        self.log_dir,
+                        "cleanup_worker",
+                        event="end",
+                        stage=self.stage,
+                        elapsed_ms=(time.perf_counter() - started) * 1000,
+                    )
+        except Exception as exc:
+            self.cleanup_error = f"{type(exc).__name__}: {exc}"
+
+    def cleanup_progress(self):
+        if self.cleanup_error:
+            raise RuntimeError(self.cleanup_error)
+        return {
+            "cleanup_done": self.retired is None
+            and (self.cleanup_thread is None or not self.cleanup_thread.is_alive())
+        }
+
+    def _wait_cleanup(self):
+        if self.cleanup_thread is not None:
+            self.cleanup_thread.join(timeout=60)
+            if self.cleanup_thread.is_alive():
+                raise TimeoutError("old resource cleanup did not quiesce")
+        if self.cleanup_error:
+            raise RuntimeError(self.cleanup_error)
+        if self.retired is not None:
+            raise ValueError("old resource cleanup has not started")

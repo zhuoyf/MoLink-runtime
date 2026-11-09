@@ -6,6 +6,23 @@ from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationErro
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
 
+def required_migration_blocks(pool):
+    """Retain live requests and reusable prefixes, including shared cached KV."""
+    disabled = getattr(pool, "_pipelive_disabled", set())
+    cached = pool.cached_block_hashes_by_block
+    return [
+        block.block_id
+        for block in pool.blocks
+        if block.block_id not in disabled
+        and not block.is_null
+        and (
+            block.ref_cnt > 0
+            or block.block_hash is not None
+            or cached.get(block.block_id)
+        )
+    ]
+
+
 def plan_resize(pool, capacity):
     if type(capacity) is not int or capacity < 2:
         raise ReconfigurationValidationError(

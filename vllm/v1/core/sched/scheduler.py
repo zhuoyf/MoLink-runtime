@@ -1666,6 +1666,14 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=self._get_new_block_ids_to_zero(),
             has_sync_kv_loads=has_sync_kv_loads,
             kv_cache_block_copies=pending_kv_cache_block_copies,
+            pipelive_block_generations=(
+                [
+                    b.allocation_generation
+                    for b in self.kv_cache_manager.block_pool.blocks
+                ]
+                if os.environ.get("HETVLLM_PIPELIVE") == "1"
+                else None
+            ),
             kv_connector_block_state=kv_connector_block_state,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),

@@ -17,6 +17,7 @@ from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationErro
 from vllm.distributed.pp_reconfigure.monitor import write_event
 from vllm.distributed.pp_reconfigure.transport import NixlTransport, PPTransport
 from vllm.distributed.pp_reconfigure.weights import (
+    CPUWeightCache,
     load_local_layers,
     local_weight_files,
 )
@@ -61,6 +62,9 @@ class LayerMigration:
         self.config = worker.vllm_config
         self.stage = get_pp_group().rank_in_group
         self.prepared: Prepared | None = None
+        self.weight_cache = CPUWeightCache(
+            int(os.environ.get("HETVLLM_PIPELIVE_WEIGHT_CACHE_BYTES", "0"))
+        )
 
     @property
     def model(self):
@@ -249,7 +253,10 @@ class LayerMigration:
                         set_current_vllm_config(self.config),
                     ):
                         result = load_local_layers(
-                            self.config, tx.new_layers, self.worker.device
+                            self.config,
+                            tx.new_layers,
+                            self.worker.device,
+                            self.weight_cache,
                         )
                 finally:
                     stream.synchronize()
@@ -428,15 +435,22 @@ def migration_rpc(worker, action, boundary=None, log_dir=None):
         migration = worker._molink_migration
         if action in ("describe", "prepare", "prepare_live", "prepare_resize_live"):
             result = getattr(migration, action)(boundary)
-        elif action == "start_live":
-            result = migration.start_live(log_dir)
+        elif action in ("start_live", "start_history"):
+            result = migration.start_live(
+                log_dir, patching=action == "start_live", **boundary
+            )
         elif action == "load_and_transfer":
-            result = migration.load_and_transfer(log_dir)
+            if isinstance(boundary, dict):
+                result = migration.load_and_transfer(log_dir, **boundary)
+            else:
+                result = migration.load_and_transfer(log_dir)
         elif action in (
             "connect",
             "commit",
             "rollback",
             "finalize",
+            "start_cleanup",
+            "cleanup_progress",
             "progress_live",
             "prepared_live",
             "commit_resize_live",

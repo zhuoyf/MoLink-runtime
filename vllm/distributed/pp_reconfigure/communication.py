@@ -7,6 +7,7 @@ import json
 import socket
 import threading
 import time
+from collections import defaultdict
 from typing import Any
 
 import torch
@@ -25,7 +26,10 @@ def serialize_inference_nccl(operation):
             handles = []
             if operation.__name__ == "isend_tensor_dict":
                 handles = result
-            elif operation.__name__ == "irecv_tensor_dict" and result is not None:
+            elif (
+                operation.__name__ == "_irecv_tensor_dict_payload"
+                and result is not None
+            ):
                 handles = result[1]
             for handle in handles:
                 handle.wait()
@@ -72,6 +76,7 @@ class MigrationChannel:
         self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.reader = self.socket.makefile("rb")
         self.rejections = 0
+        self.timings_ms = defaultdict(float)
 
     def close(self):
         # The communicator and TCP channel are reused across transactions.
@@ -88,11 +93,22 @@ class MigrationChannel:
 
     def send(self, tensor, metadata):
         while True:
+            started = time.perf_counter()
             with self.mutex:
+                acquired = time.perf_counter()
+                self.timings_ms["communication_lock_wait"] += (
+                    acquired - started
+                ) * 1000
                 if pending := getattr(self.group, "pipelive_pending", None):
                     pending.synchronize()
+                pending_done = time.perf_counter()
+                self.timings_ms["inference_nccl_wait"] += (
+                    pending_done - acquired
+                ) * 1000
                 self.send_control({"op": "ACK", **metadata})
                 reply = self.receive_control()
+                handshake_done = time.perf_counter()
+                self.timings_ms["handshake"] += (handshake_done - pending_done) * 1000
                 if reply["op"] == "ACCEPT":
                     with torch.cuda.stream(self.stream):
                         begin = torch.cuda.Event(enable_timing=True)
@@ -104,7 +120,14 @@ class MigrationChannel:
                             )
                         end.record()
                         end.synchronize()
+                    nccl_done = time.perf_counter()
+                    self.timings_ms["nccl_enqueue_and_wait"] += (
+                        nccl_done - handshake_done
+                    ) * 1000
                     applied = self.receive_control()
+                    self.timings_ms["applied_ack_wait"] += (
+                        time.perf_counter() - nccl_done
+                    ) * 1000
                     if applied["op"] != "APPLIED":
                         raise RuntimeError(
                             f"invalid migration acknowledgement: {applied}"
@@ -113,7 +136,11 @@ class MigrationChannel:
                 if reply["op"] != "REJECT":
                     raise RuntimeError(f"invalid migration handshake: {reply}")
                 self.rejections += 1
+            retry_started = time.perf_counter()
             time.sleep(0.001)
+            self.timings_ms["retry_backoff"] += (
+                time.perf_counter() - retry_started
+            ) * 1000
 
     def receive(self, apply):
         metadata = self.receive_control()

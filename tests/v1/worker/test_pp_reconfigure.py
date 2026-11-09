@@ -499,6 +499,49 @@ def test_dirty_drain_keeps_later_writes_and_coalesces_overwrites():
         bitmap.mark([64])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.parametrize("factor", [1, 2, 4, 8])
+@pytest.mark.parametrize("pipelive", [False, True])
+def test_initial_kv_plan_respects_physical_stacked_budget(
+    monkeypatch, block_size, factor, pipelive
+):
+    """Automatic planning must fit the allocator's real storage, including padding."""
+    from vllm.distributed.pp_reconfigure.cache import StackedKVCache
+    from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheGroupSpec,
+        KVCacheLayout,
+    )
+
+    monkeypatch.setenv("HETVLLM_PIPELIVE", "1" if pipelive else "0")
+    monkeypatch.setenv("HETVLLM_PIPELIVE_STACK", str(factor))
+    spec = FullAttentionSpec(
+        block_size=block_size, num_kv_heads=32, head_size=128, dtype=torch.float16
+    )
+    names = [f"model.layers.{i}.self_attn.attn" for i in range(8)]
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            num_gpu_blocks_override=None,
+            prefix_cache_retention_interval=1,
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBHNC,
+        )
+    )
+    budget = 32 << 20
+    planned = get_kv_cache_config_from_groups(
+        config, [KVCacheGroupSpec(names, spec)], budget
+    )
+    if not pipelive:
+        assert planned.num_blocks == (16 if block_size == 16 else 4)
+        return
+    pool = StackedKVCache(
+        names, spec, planned.num_blocks, torch.device("cuda:0"), factor
+    )
+    assert 0 < pool.allocated_bytes <= budget
+    assert planned.kv_cache_tensors[0].size == pool.allocated_bytes
+
+
 @pytest.mark.parametrize("copy_block", [None, 2])
 def test_inference_marks_optional_block_copies_without_advancing_token_count(
     copy_block,
@@ -552,6 +595,87 @@ def test_receiver_rejects_migration_until_inference_completes(in_flight):
         channel.mutex.release()
 
 
+def test_channel_accounts_for_rejection_and_each_sender_wait():
+    import threading
+    from collections import defaultdict
+    from contextlib import nullcontext
+    from unittest.mock import Mock
+
+    from vllm.distributed.pp_reconfigure.communication import MigrationChannel
+
+    channel = MigrationChannel.__new__(MigrationChannel)
+    channel.mutex = threading.RLock()
+    channel.timings_ms = defaultdict(float)
+    channel.group = SimpleNamespace(rank_in_group=0, pipelive_pending=Mock())
+    channel.stream, channel.comm = Mock(), Mock()
+    channel.send_control = Mock()
+    channel.receive_control = Mock(
+        side_effect=[{"op": op} for op in ("REJECT", "ACCEPT", "APPLIED")]
+    )
+    channel.rejections = 0
+    with (
+        patch("torch.cuda.stream", return_value=nullcontext()),
+        patch("torch.cuda.Event"),
+        patch(
+            "vllm.distributed.pp_reconfigure.communication.time.perf_counter",
+            side_effect=range(12),
+        ),
+        patch("vllm.distributed.pp_reconfigure.communication.time.sleep"),
+    ):
+        channel.send(torch.ones(1), {"version": 1})
+    assert channel.rejections == 1
+    assert dict(channel.timings_ms) == {
+        "communication_lock_wait": 2000,
+        "inference_nccl_wait": 2000,
+        "handshake": 2000,
+        "nccl_enqueue_and_wait": 1000,
+        "applied_ack_wait": 1000,
+        "retry_backoff": 1000,
+    }
+    channel.comm.send.assert_called_once()
+
+
+def test_inference_metadata_wait_does_not_reserve_migration_nccl(monkeypatch):
+    """Reverse migration may enter while the upstream stage is still computing."""
+    import threading
+    from unittest.mock import Mock
+
+    from vllm.distributed import pp_link
+    from vllm.distributed.parallel_state import GroupCoordinator
+
+    group = GroupCoordinator.__new__(GroupCoordinator)
+    group.world_size = 2
+    group.rank_in_group = 1
+    group.use_cpu_custom_send_recv = False
+    group.device_group = group.cpu_group = None
+    group.device = torch.device("cuda:0")
+    group.pipelive_mutex = threading.Lock()
+    entered = []
+
+    def metadata(src):
+        assert src == 0
+        assert group.pipelive_mutex.acquire(blocking=False)
+        group.pipelive_mutex.release()
+        entered.append(True)
+        return [("marker", 42)]
+
+    group.recv_object = metadata
+    monkeypatch.setattr(pp_link, "is_link_receiver", lambda rank: False)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    event = object()
+
+    def record_event():
+        assert group.pipelive_mutex.locked()
+        return event
+
+    monkeypatch.setattr(
+        torch.cuda, "current_stream", lambda device: Mock(record_event=record_event)
+    )
+    assert group.recv_tensor_dict() == {"marker": 42}
+    assert entered == [True] and group.pipelive_pending is event
+    assert not group.pipelive_mutex.locked()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_patches_preserve_unwritten_slots_and_stack_release():
     from vllm.distributed.pp_reconfigure.cache import StackedKVCache
@@ -583,12 +707,438 @@ def test_patches_preserve_unwritten_slots_and_stack_release():
     torch.testing.assert_close(source.handles[name][:4], address)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("slots", [[], [1, 17, 31]])
+def test_snapshot_batches_layers_and_acknowledges_after_all_are_applied(slots):
+    """One handshake carries every layer, preserving slot and watermark semantics."""
+    import threading
+    from collections import defaultdict
+
+    from vllm.distributed.pp_reconfigure.cache import StackedKVCache
+    from vllm.distributed.pp_reconfigure.live import LiveLayerMigration
+    from vllm.distributed.pp_reconfigure.patching import PatchLifecycle, copy_slots
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=64, dtype=torch.float16
+    )
+    names = [f"model.layers.{i}.self_attn.attn" for i in range(8)]
+    source = StackedKVCache(names, spec, 2, torch.device("cuda:0"), 4)
+    target = StackedKVCache(names, spec, 2, torch.device("cuda:0"), 4)
+    for index, name in enumerate(names):
+        for block in (0, 1):
+            source.block(name, block).fill_(index + 1)
+    live = LiveLayerMigration.__new__(LiveLayerMigration)
+    live.prepared = SimpleNamespace(
+        moving=list(range(8)),
+        old_kv=source.handles,
+        old_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+    )
+    live.cache_lock = threading.RLock()
+    live.last_write = torch.cuda.current_stream().record_event()
+    live.log_dir = None
+    live.communication_intervals, live.patch_intervals = [], []
+    live.bytes_sent = live.patch_rounds = live.applied = 0
+    live.transferred_slots = set()
+    live.lifecycle = PatchLifecycle([0, 1])
+    live.send_version = 0
+    live.full_done = False
+    received = []
+
+    def send(payload, metadata):
+        live.channel.stream.synchronize()
+        assert live.applied == 0
+        assert payload.nbytes <= 16 << 20
+        assert metadata["last"] and metadata["watermark"] == 24
+        assert metadata["version"] == 1
+        for name, layer_payload in zip(metadata["layers"], payload, strict=True):
+            copy_slots(target.handles[name], metadata["slots"], layer_payload)
+        torch.cuda.current_stream().synchronize()
+        received.append(metadata)
+        return None, None
+
+    live.channel = SimpleNamespace(
+        stream=torch.cuda.Stream(), send=send, timings_ms=defaultdict(float)
+    )
+    live._send_snapshot(slots, 24)
+    assert len(received) == 1 and live.applied == 24
+    assert live.transferred_slots == set(slots)
+    assert live.patch_rounds == bool(slots)
+    for index, name in enumerate(names):
+        expected = torch.zeros_like(target.block(name, 0))
+        if slots:
+            expected[:, 1] = index + 1
+        torch.testing.assert_close(target.block(name, 0), expected)
+        expected.zero_()
+        if slots:
+            expected[:, [1, 15]] = index + 1
+        torch.testing.assert_close(target.block(name, 1), expected)
+
+
+def test_history_manifest_keeps_live_shared_prefixes_and_excludes_unused_blocks():
+    from vllm.distributed.pp_reconfigure.resize import required_migration_blocks
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+
+    blocks = [KVCacheBlock(i) for i in range(7)]
+    blocks[0].is_null = True
+    blocks[1].ref_cnt = 2
+    blocks[2].ref_cnt = 1
+    blocks[3].set_block_hash(b"cached-prefix")
+    blocks[6].ref_cnt = 0
+    pool = SimpleNamespace(
+        blocks=blocks,
+        cached_block_hashes_by_block={4: {b"shared-alias"}},
+        _pipelive_disabled={6},
+    )
+    assert required_migration_blocks(pool) == [1, 2, 3, 4]
+    blocks[1].ref_cnt = 0
+    blocks[3].reset_hash()
+    assert required_migration_blocks(pool) == [2, 4]
+
+
+def test_cpu_weight_cache_bounds_resident_tensors_and_falls_back_to_disk():
+    from unittest.mock import Mock
+
+    from vllm.distributed.pp_reconfigure.weights import CPUWeightCache
+
+    cache = CPUWeightCache(8)
+    cache.get("a", lambda: torch.tensor([1.0]))
+    cache.get("b", lambda: torch.tensor([2.0]))
+    unused = Mock(side_effect=AssertionError("cache hit must not read disk"))
+    assert cache.get("a", unused).item() == 1
+    cache.get("c", lambda: torch.tensor([3.0]))
+    assert list(cache.tensors) == ["a", "c"]
+    assert cache.metrics()["resident_bytes"] == 8
+    assert cache.metrics()["evicted_bytes"] == 4
+    oversized = torch.arange(3, dtype=torch.float32)
+    assert cache.get("large", lambda: oversized) is oversized
+    assert cache.metrics()["resident_bytes"] == 8 and "large" not in cache.tensors
+    disabled = CPUWeightCache(0)
+    loader = Mock(return_value=torch.tensor([4.0]))
+    disabled.get("a", loader)
+    disabled.get("a", loader)
+    assert loader.call_count == 2 and disabled.metrics()["resident_bytes"] == 0
+    with pytest.raises(ValueError, match="nonnegative"):
+        CPUWeightCache(-1)
+
+
+def test_cpu_weight_prefetch_selects_target_layers_within_budget(tmp_path):
+    from safetensors.torch import save_file
+
+    from vllm.distributed.pp_reconfigure.weights import CPUWeightCache
+
+    path = tmp_path / "weights.safetensors"
+    tensors = {
+        f"model.layers.{i}.weight": torch.tensor([float(i)]) for i in (12, 13, 14)
+    }
+    save_file(tensors, path)
+    cache = CPUWeightCache(8)
+    with patch(
+        "vllm.distributed.pp_reconfigure.weights.local_weight_files",
+        return_value=[str(path)],
+    ):
+        cache.prefetch(None, [12, 13, 14])
+        cache.thread.join(5)
+    assert not cache.thread.is_alive() and cache.prefetch_error is None
+    assert set(cache.tensors) == {"model.layers.12.weight", "model.layers.13.weight"}
+    assert cache.metrics()["resident_bytes"] == 8
+    torch.testing.assert_close(
+        cache.tensors["model.layers.12.weight"], tensors["model.layers.12.weight"]
+    )
+
+
+def test_prefetch_error_preserves_foreground_disk_error():
+    from unittest.mock import Mock
+
+    from vllm.distributed.pp_reconfigure.weights import CPUWeightCache
+
+    cache = CPUWeightCache(8)
+    with patch(
+        "vllm.distributed.pp_reconfigure.weights.local_weight_files",
+        side_effect=OSError("offline"),
+    ):
+        cache.prefetch(None, [12])
+        cache.thread.join(5)
+    assert "offline" in cache.prefetch_error
+    with pytest.raises(OSError, match="offline"):
+        cache.get("missing", Mock(side_effect=OSError("offline")))
+
+
+def test_block_reallocation_advances_generation_and_patch_replay_is_rejected():
+    from vllm.distributed.pp_reconfigure.patching import PatchLifecycle
+    from vllm.v1.core.block_pool import BlockPool
+
+    pool = BlockPool(3, enable_caching=True, hash_block_size=16)
+    block = pool.get_new_blocks(1)[0]
+    assert block.allocation_generation == 1
+    pool.free_blocks([block])
+    assert block in pool.get_new_blocks(2)
+    assert block.allocation_generation == 2
+    lifecycle = PatchLifecycle([0, 2, 1])
+    with lifecycle.lock:
+        assert lifecycle.accept(1, [(1, 1), (2, 1)]) == {2}
+        assert lifecycle.accept(2, [(1, 2)]) == {1}
+        for version in (1, 2, 4):
+            with pytest.raises(ValueError, match="replayed"):
+                lifecycle.accept(version, [(1, 2)])
+
+
+def test_unchanged_generations_do_not_wait_for_inflight_patch():
+    import threading
+
+    from vllm.distributed.pp_reconfigure.patching import PatchLifecycle
+
+    lifecycle = PatchLifecycle([0, 1])
+    finished = threading.Event()
+    observed = []
+
+    def observe():
+        observed.append(lifecycle.observe([0, 1]))
+        finished.set()
+
+    with lifecycle.lock:
+        thread = threading.Thread(target=observe)
+        thread.start()
+        completed_while_patch_locked = finished.wait(1)
+    thread.join(5)
+    assert not thread.is_alive()
+    assert completed_while_patch_locked
+    assert observed == [[]]
+
+
+def test_reused_generation_waits_for_inflight_patch():
+    import threading
+
+    from vllm.distributed.pp_reconfigure.patching import PatchLifecycle
+
+    lifecycle = PatchLifecycle([0, 1])
+    started = threading.Event()
+    finished = threading.Event()
+    observed = []
+
+    def observe():
+        started.set()
+        observed.append(lifecycle.observe([0, 2]))
+        finished.set()
+
+    with lifecycle.lock:
+        thread = threading.Thread(target=observe)
+        thread.start()
+        assert started.wait(5)
+        assert not finished.wait(0.05)
+        assert lifecycle.generations == [0, 1]
+    thread.join(5)
+    assert not thread.is_alive()
+    assert observed == [[1]]
+    assert lifecycle.generations == [0, 2]
+
+
+def test_history_only_mode_defers_dirty_patches_until_final_sync():
+    import threading
+
+    from vllm.distributed.pp_reconfigure.live import LiveLayerMigration
+    from vllm.distributed.pp_reconfigure.patching import DirtyBitmap
+
+    live = LiveLayerMigration.__new__(LiveLayerMigration)
+    pool = SimpleNamespace(spec=SimpleNamespace(block_size=1))
+    live.prepared = SimpleNamespace(
+        moving=[0],
+        kv_ready=False,
+        old_kv={
+            "model.layers.0.self_attn.attn": SimpleNamespace(_pipelive=(pool, None))
+        },
+    )
+    live.history_block_ids = [1]
+    live.patching = False
+    live.finish = threading.Event()
+    live.cache_lock = threading.RLock()
+    live.bitmap = DirtyBitmap(2)
+    live.bitmap.mark([1])
+    live.applied = 0
+    historical_done = threading.Event()
+    snapshots, controls, errors = [], [], []
+
+    def snapshot(slots, watermark, full=False):
+        snapshots.append((slots, watermark, full))
+        live.applied = watermark
+        if full:
+            historical_done.set()
+
+    def run():
+        try:
+            live._send_loop()
+        except BaseException as exc:
+            errors.append(exc)
+
+    live._send_snapshot = snapshot
+    live.channel = SimpleNamespace(
+        send_control=controls.append, receive_control=lambda: {"op": "STOPPED"}
+    )
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    try:
+        assert historical_done.wait(5)
+        assert snapshots == [([1], 0, True)] and thread.is_alive()
+    finally:
+        live.finish.set()
+        thread.join(5)
+    assert not thread.is_alive() and not errors
+    assert snapshots == [([1], 0, True), ([1], 1, False)]
+    assert controls == [{"op": "STOP"}] and live.prepared.kv_ready
+
+
+def test_reused_block_is_fully_dirtied_without_changing_convergence_watermark():
+    from vllm.distributed.pp_reconfigure.live import LiveLayerMigration
+    from vllm.distributed.pp_reconfigure.patching import DirtyBitmap, PatchLifecycle
+
+    live = LiveLayerMigration.__new__(LiveLayerMigration)
+    live.stage = 0
+    live.log_dir = None
+    live.lifecycle = PatchLifecycle([0, 1, 1])
+    live.bitmap = DirtyBitmap(48)
+    live.prepared = SimpleNamespace(
+        source=0,
+        old_config=SimpleNamespace(
+            kv_cache_groups=[
+                SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))
+            ]
+        ),
+    )
+    live.before_step(SimpleNamespace(pipelive_block_generations=[0, 2, 1]))
+    assert live.bitmap.drain() == (list(range(16, 32)), 0)
+    live.before_step(SimpleNamespace(pipelive_block_generations=[0, 1, 1]))
+    assert live.bitmap.drain() == ([], 0)
+    assert live.lifecycle.generations == [0, 2, 1]
+
+
+@pytest.mark.parametrize("still_running", [False, True])
+def test_background_error_rolls_back_only_after_all_tasks_quiesce(still_running):
+    import threading
+    from unittest.mock import Mock
+
+    from vllm.distributed.pp_reconfigure.live import LiveLayerMigration
+    from vllm.distributed.pp_reconfigure.worker import LayerMigration
+
+    live = LiveLayerMigration.__new__(LiveLayerMigration)
+    live.preparing = False
+    live.active = True
+    live.error = "injected weight load failure"
+    live.finish = threading.Event()
+    live.kv_thread = Mock(is_alive=lambda: still_running)
+    live.weights_thread = Mock(is_alive=lambda: False)
+    live.worker = SimpleNamespace(device=torch.device("cuda:0"))
+    live.gpu_profiler = None
+    with (
+        patch("torch.accelerator.synchronize") as synchronize,
+        patch.object(
+            LayerMigration, "rollback", return_value={"rolled_back": True}
+        ) as restore,
+    ):
+        if still_running:
+            with pytest.raises(TimeoutError, match="did not quiesce"):
+                live.rollback()
+            restore.assert_not_called()
+            assert live.active
+        else:
+            assert live.rollback() == {"rolled_back": True}
+            restore.assert_called_once()
+            live.kv_thread.join.assert_called_once_with(timeout=60)
+            live.weights_thread.join.assert_called_once_with(timeout=60)
+            synchronize.assert_called_once_with(live.worker.device)
+            assert not live.active
+        assert live.finish.is_set()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_inflight_patch_cannot_overwrite_reallocated_block():
+    """Apply a captured old payload after reuse, then apply the new generation."""
+    from vllm.distributed.pp_reconfigure.cache import StackedKVCache
+    from vllm.distributed.pp_reconfigure.live import LiveLayerMigration
+    from vllm.distributed.pp_reconfigure.patching import PatchLifecycle, copy_slots
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=2, head_size=64, dtype=torch.float16
+    )
+    names = [f"model.layers.{i}.self_attn.attn" for i in range(4)]
+    source = StackedKVCache(names, spec, 2, torch.device("cuda:0"), 4)
+    incoming = StackedKVCache(names, spec, 2, torch.device("cuda:0"), 4)
+    slots = list(range(16, 32))
+    for name in names:
+        source.block(name, 1).fill_(7)
+        incoming.block(name, 1).fill_(42)
+    old_payload = torch.stack([copy_slots(source.handles[n], slots) for n in names])
+    torch.cuda.synchronize()
+    for name in names:
+        source.block(name, 1).fill_(9)
+    new_payload = torch.stack([copy_slots(source.handles[n], slots) for n in names])
+    torch.cuda.synchronize()
+    live = LiveLayerMigration.__new__(LiveLayerMigration)
+    live.prepared = SimpleNamespace(
+        new_kv=incoming.handles,
+        kv_ready=False,
+        old_config=SimpleNamespace(
+            kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+    )
+    live.log_dir = None
+    live.stage = 1
+    live.lifecycle = PatchLifecycle([0, 2])
+    live.stale_slots = live.bytes_sent = live.patch_rounds = live.applied = 0
+    live.full_done = False
+    live.transferred_slots = set()
+    events = iter([(old_payload, 1, 1), (new_payload, 2, 2)])
+
+    def receive(apply):
+        item = next(events, None)
+        if item is None:
+            return False
+        payload, version, generation = item
+        with torch.cuda.stream(live.channel.stream):
+            apply(
+                payload,
+                dict(
+                    transaction=None,
+                    version=version,
+                    generations=[(1, generation)],
+                    layers=names,
+                    slots=slots,
+                    watermark=version,
+                    last=True,
+                    full=False,
+                ),
+            )
+        for name in names:
+            assert torch.all(incoming.block(name, 1) == (42 if version == 1 else 9))
+            assert torch.all(source.block(name, 1) == 9)
+        return True
+
+    live.channel = SimpleNamespace(stream=torch.cuda.Stream(), receive=receive)
+    live._receive_loop()
+    assert live.stale_slots == 16 and live.lifecycle.version == 2
+    assert live.prepared.kv_ready and live.applied == 2
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
-    [None, "prepare_live", "start_live", "progress_live", "sync_live", "commit"],
+    [
+        None,
+        "prepare_live",
+        "start_live",
+        "progress_live",
+        "sync_live",
+        "commit",
+        "start_cleanup",
+        "cleanup_progress",
+    ],
 )
-async def test_async_streams_before_pause_and_syncs_before_commit(tmp_path, failure):
+@pytest.mark.parametrize("mode", ["async", "async_no_patching"])
+async def test_async_streams_before_pause_and_syncs_before_commit(
+    tmp_path, failure, mode
+):
     class LiveEngine(Engine):
         async def call_utility_async(self, method, *args):
             workers = await super().call_utility_async(method, *args)
@@ -605,10 +1155,18 @@ async def test_async_streams_before_pause_and_syncs_before_commit(tmp_path, fail
                 )
                 if action == "prepared_live":
                     worker["prepared"] = True
+                if action == "finalize":
+                    worker["cleanup_pending"] = True
+                if action in ("start_cleanup", "cleanup_progress"):
+                    assert not self.paused
+                    worker["cleanup_done"] = True
                 if action == "progress_live":
                     assert not self.paused
                     worker.update(
-                        full_done=True, weights_ready=True, scheduled=9, applied=9
+                        full_done=True,
+                        weights_ready=True,
+                        scheduled=1000 if mode == "async_no_patching" else 9,
+                        applied=0 if mode == "async_no_patching" else 9,
                     )
                 if action == "sync_live":
                     assert self.paused
@@ -617,31 +1175,39 @@ async def test_async_streams_before_pause_and_syncs_before_commit(tmp_path, fail
                         communication_intervals_ms=[(2, 4)],
                         bytes=100,
                         steps=3,
-                        scheduled=9,
-                        applied=9,
+                        scheduled=1000 if mode == "async_no_patching" else 9,
+                        applied=1000 if mode == "async_no_patching" else 9,
                         dirty_slots=0,
                         kv_ready=True,
                     )
             return workers
 
-    engine = LiveEngine(fail=failure)
+    start_action = "start_history" if mode == "async_no_patching" else "start_live"
+    engine = LiveEngine(fail=start_action if failure == "start_live" else failure)
+    if failure in ("start_cleanup", "cleanup_progress"):
+        with pytest.raises(RuntimeError, match="committed_and_resumed"):
+            await ReconfigurationController(engine, tmp_path).reconfigure(6, mode)
+        assert not engine.paused and "rollback" not in engine.calls
+        return
     if failure:
         with pytest.raises(RuntimeError, match="rolled_back_and_resumed"):
-            await ReconfigurationController(engine, tmp_path).reconfigure(6, "async")
+            await ReconfigurationController(engine, tmp_path).reconfigure(6, mode)
         assert engine.calls[-2:] == ["rollback", "resume"]
         return
-    result = await ReconfigurationController(engine, tmp_path).reconfigure(6, "async")
+    result = await ReconfigurationController(engine, tmp_path).reconfigure(6, mode)
     assert engine.calls == [
         "describe",
         "prepare_live",
         "prepared_live",
-        "start_live",
+        start_action,
         "progress_live",
         "pause",
         "sync_live",
         "commit",
         "finalize",
         "resume",
+        "start_cleanup",
+        "cleanup_progress",
     ]
     assert result["metrics"]["overlap_fraction"] == 1
     assert result["metrics"]["inference_steps_during_migration"] == 3
@@ -787,11 +1353,15 @@ async def test_validation_failure_keeps_conflict_type_and_does_not_pause(tmp_pat
     assert not engine.paused
 
 
-def test_finalize_collects_old_cyclic_weights_before_return():
+@pytest.mark.parametrize("defer", [True, False])
+def test_finalize_retains_old_weights_until_post_resume_cleanup(monkeypatch, defer):
     import gc
     import weakref
+    from contextlib import nullcontext
 
     from vllm.distributed.pp_reconfigure.live import LiveLayerMigration
+
+    monkeypatch.setenv("HETVLLM_PIPELIVE_DEFER_CLEANUP", "1" if defer else "0")
 
     class OldLayer:
         pass
@@ -801,6 +1371,10 @@ def test_finalize_collects_old_cyclic_weights_before_return():
     reference = weakref.ref(old)
     migration = LiveLayerMigration.__new__(LiveLayerMigration)
     migration.stage = 1
+    migration.worker = SimpleNamespace(device=torch.device("cuda:0"))
+    migration.cleanup_thread = None
+    migration.cleanup_error = None
+    migration.log_dir = None
     migration.prepared = SimpleNamespace(
         committed=True,
         source=0,
@@ -810,8 +1384,16 @@ def test_finalize_collects_old_cyclic_weights_before_return():
     gc.freeze()
     del old
     try:
-        with patch("torch.accelerator.empty_cache"):
+        with (
+            patch("torch.accelerator.empty_cache"),
+            patch("torch.accelerator.device_index", return_value=nullcontext()),
+        ):
             migration.finalize()
+            assert migration.prepared is None
+            if defer:
+                assert reference() is not None
+                migration.start_cleanup()
+            migration._wait_cleanup()
         assert reference() is None
     finally:
         gc.unfreeze()

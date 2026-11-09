@@ -44,10 +44,13 @@ def trial(
     tokens = [[] for _ in payload["prompt"]]
     times = [[] for _ in tokens]
     errors = []
+    request_times = {}
 
     def run():
         try:
+            request_times["submitted"] = time.time()
             generate(base, payload, ready, tokens, times)
+            request_times["finished"] = time.time()
         except BaseException as exc:
             errors.append(str(exc))
             ready.set()
@@ -71,11 +74,13 @@ def trial(
             assert len(state["requests"]) == len(payload["prompt"])
             assert all(r["num_preemptions"] == 0 for r in state["requests"].values())
             resize_states.append(state)
+    migration_started = time.time()
     result = read_json(
         base,
         "/molink/reconfigure",
         {"boundary": boundary, "mode": mode, "verify_kv": verify_kv},
     )
+    migration_finished = time.time()
     thread.join(180)
     assert not thread.is_alive() and not errors, errors
     (Path(result["log_dir"]) / "tokens.json").write_text(
@@ -101,7 +106,7 @@ def trial(
     for key, state in active.items():
         assert after["requests"][key] == state
         assert state["num_preemptions"] == 0
-    if mode == "async":
+    if mode in ("async", "async_no_patching"):
         assert result["metrics"]["inference_steps_during_migration"] > 0
     result["generated_tokens"] = [len(row) for row in tokens]
     result["active_requests_at_commit"] = len(active)
@@ -111,6 +116,8 @@ def trial(
     result["resize_results"] = resize_results
     result["resize_states"] = resize_states
     result["stream_token_times"] = times
+    result["request_times"] = request_times
+    result["migration_http_times"] = [migration_started, migration_finished]
     return result
 
 

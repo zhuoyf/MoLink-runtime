@@ -16,7 +16,7 @@ router = APIRouter(prefix="/molink")
 
 class ReconfigureRequest(BaseModel):
     boundary: StrictInt
-    mode: Literal["sync", "async"] = "sync"
+    mode: Literal["sync", "async", "async_no_patching"] = "sync"
     verify_kv: bool = False
 
 

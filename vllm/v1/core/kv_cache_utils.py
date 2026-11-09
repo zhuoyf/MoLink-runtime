@@ -181,6 +181,7 @@ class KVCacheBlock:
 
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
+    allocation_generation: int = 0
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
@@ -1367,6 +1368,15 @@ def _get_kv_cache_bytes_per_block(
         for group in kv_cache_groups
     )
     assert bytes_per_block > 0
+    if os.environ.get("HETVLLM_PIPELIVE") == "1" and len(kv_cache_groups) == 1:
+        group = kv_cache_groups[0]
+        if type(group.kv_cache_spec) is FullAttentionSpec:
+            factor = int(os.environ.get("HETVLLM_PIPELIVE_STACK", "2"))
+            if factor < 1 or len(group.layer_names) % factor:
+                raise ValueError("PipeLive layer count must align to stacking factor")
+            # Match the independently allocated stacks, including physical padding.
+            stack_bytes = cdiv(factor * group.kv_cache_spec.page_size_bytes, 2 << 20)
+            bytes_per_block = len(group.layer_names) // factor * stack_bytes * (2 << 20)
     return bytes_per_block
 
 

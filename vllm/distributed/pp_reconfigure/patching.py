@@ -18,10 +18,12 @@ def live_step(operation):
         if live is None or not live.active:
             return operation(worker, *args, **kwargs)
         with live.cache_lock:
+            output = args[0] if args else kwargs["scheduler_output"]
+            live.before_step(output)
             if live.gathered is not None:
                 torch.cuda.current_stream(worker.device).wait_event(live.gathered)
             result = operation(worker, *args, **kwargs)
-            live.after_step(args[0] if args else kwargs["scheduler_output"])
+            live.after_step(output)
             return result
 
     return call
@@ -65,6 +67,47 @@ class DirtyBitmap:
             slots = np.flatnonzero(self.bits).tolist()
             self.bits.fill(False)
             return slots, self.scheduled
+
+
+class PatchLifecycle:
+    """Monotone allocation generations and FIFO patch versions per transaction."""
+
+    def __init__(self, generations):
+        self.generations = list(generations)
+        self.version = 0
+        self.lock = threading.RLock()
+
+    def observe(self, generations):
+        if len(generations) != len(self.generations):
+            raise ValueError("KV capacity changed during migration")
+        # Monotone generations let unchanged Decode bypass an in-flight apply.
+        if all(
+            generation <= current
+            for generation, current in zip(generations, self.generations)
+        ):
+            return []
+        with self.lock:
+            changed = [
+                block
+                for block, generation in enumerate(generations)
+                if generation > self.generations[block]
+            ]
+            for block in changed:
+                self.generations[block] = generations[block]
+            return changed
+
+    def accept(self, version, generations):
+        if version != self.version + 1:
+            raise ValueError("out-of-order or replayed KV patch")
+        valid = set()
+        for block, generation in generations:
+            if not 0 <= block < len(self.generations):
+                raise ValueError("patch block outside KV allocation")
+            if generation >= self.generations[block]:
+                valid.add(block)
+                self.generations[block] = generation
+        self.version = version
+        return valid
 
 
 @triton.jit
