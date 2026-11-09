@@ -26,10 +26,7 @@ def serialize_inference_nccl(operation):
             handles = []
             if operation.__name__ == "isend_tensor_dict":
                 handles = result
-            elif (
-                operation.__name__ == "_irecv_tensor_dict_payload"
-                and result is not None
-            ):
+            elif operation.__name__ == "_irecv_tensor_dict_payload":
                 handles = result[1]
             for handle in handles:
                 handle.wait()

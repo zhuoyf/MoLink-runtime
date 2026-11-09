@@ -13,17 +13,16 @@ from vllm.triton_utils import tl, triton
 
 def live_step(operation):
     @functools.wraps(operation)
-    def call(worker, *args, **kwargs):
+    def call(worker, scheduler_output):
         live = getattr(worker, "_pp_reconfigure", None)
         if live is None or not live.active:
-            return operation(worker, *args, **kwargs)
+            return operation(worker, scheduler_output)
         with live.cache_lock:
-            output = args[0] if args else kwargs["scheduler_output"]
-            live.before_step(output)
+            live.before_step(scheduler_output)
             if live.gathered is not None:
                 torch.cuda.current_stream(worker.device).wait_event(live.gathered)
-            result = operation(worker, *args, **kwargs)
-            live.after_step(output)
+            result = operation(worker, scheduler_output)
+            live.after_step(scheduler_output)
             return result
 
     return call

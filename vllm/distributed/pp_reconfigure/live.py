@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker primitives for online layer migration and recovery."""
 
-import copy
 import gc
 import hashlib
 import threading
@@ -44,7 +43,6 @@ class LiveLayerMigration(LayerMigration):
         self.cache_lock = threading.RLock()
         self.active = False
         self.gathered = None
-        self.last_write = None
         self.preparing = False
         self.resize_pending: tuple[dict, set[StackedKVCache]] | None = None
         self.error = None
@@ -126,9 +124,6 @@ class LiveLayerMigration(LayerMigration):
         }
         return result
 
-    def prepare(self, boundary):
-        return self._prepare_live(boundary)
-
     def connect(self):
         return {"connected": True}
 
@@ -170,8 +165,6 @@ class LiveLayerMigration(LayerMigration):
             )
         self.error = None
         self.preparing = True
-        self.last_write = torch.cuda.Event()
-        self.last_write.record()
 
         def prepare():
             try:
@@ -179,7 +172,7 @@ class LiveLayerMigration(LayerMigration):
                     torch.accelerator.device_index(self.worker.device.index),
                     torch.cuda.stream(self.channel.stream),
                 ):
-                    self._prepare_live(boundary)
+                    self.prepare(boundary)
                     self.channel.stream.synchronize()
             except Exception as exc:
                 self.error = f"{type(exc).__name__}: {exc}"
@@ -195,7 +188,7 @@ class LiveLayerMigration(LayerMigration):
             raise RuntimeError(self.error)
         return {"prepared": self.prepared is not None and not self.preparing}
 
-    def _prepare_live(self, boundary):
+    def prepare(self, boundary):
         description = self.describe(boundary)
         if self.prepared is not None:
             raise ValueError("a migration is already prepared")
@@ -210,9 +203,7 @@ class LiveLayerMigration(LayerMigration):
         old_boundary = description["old_boundary"]
         moving = list(range(min(boundary, old_boundary), max(boundary, old_boundary)))
         source = 0 if boundary < old_boundary else 1
-        new_config = copy.deepcopy(old_config)
         spec = old_config.kv_cache_groups[0].kv_cache_spec
-        new_config.kv_cache_groups = [KVCacheGroupSpec(names, spec)]
         # Reuse the native configuration planner for layer metadata.
         from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups
 
@@ -221,7 +212,7 @@ class LiveLayerMigration(LayerMigration):
             self.config.cache_config.num_gpu_blocks_override = old_config.num_blocks
             new_config = get_kv_cache_config_from_groups(
                 self.config,
-                new_config.kv_cache_groups,
+                [KVCacheGroupSpec(names, spec)],
                 old_config.num_blocks * spec.page_size_bytes * len(names),
             )
         finally:
@@ -240,9 +231,7 @@ class LiveLayerMigration(LayerMigration):
                         new_layers[index] = LlamaDecoderLayer(
                             vllm_config=self.config, prefix=f"model.layers.{index}"
                         )
-                existing_ids = set(
-                    next(iter(old_kv.values()))._pp_reconfigure[0].stacks
-                )
+                existing_ids = next(iter(old_kv.values()))._pp_reconfigure[0].stacks
                 incoming = StackedKVCache(
                     [f"model.layers.{i}.self_attn.attn" for i in moving],
                     spec,
@@ -436,8 +425,7 @@ class LiveLayerMigration(LayerMigration):
                 self.channel.timings_ms["gather_lock_and_stream_entry"] += (
                     acquired - gather_started
                 ) * 1000
-                if self.last_write is not None:
-                    self.channel.stream.wait_event(self.last_write)
+                self.channel.stream.wait_event(self.last_write)
                 # Snapshot all moving layers before allowing another KV writer.
                 payload = torch.stack(
                     [copy_slots(tx.old_kv[name], chunk) for name in names]
@@ -690,8 +678,8 @@ class LiveLayerMigration(LayerMigration):
         return {"prepared_resize": True}
 
     def rollback_resize_live(self):
-        if pending := getattr(self, "resize_pending", None):
-            plan, pools = pending
+        if self.resize_pending is not None:
+            plan, pools = self.resize_pending
             torch.accelerator.synchronize(self.worker.device)
             for pool in pools:
                 added = set(plan["add"]) & pool.stacks.keys()

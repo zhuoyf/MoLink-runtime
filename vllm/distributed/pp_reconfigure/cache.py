@@ -10,10 +10,6 @@ import vllm.envs as envs
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 
-def enabled():
-    return envs.VLLM_PP_RECONFIGURE_ONLINE
-
-
 class StackedKVCache:
     """Stable logical IDs address independently releasable physical stacks.
 

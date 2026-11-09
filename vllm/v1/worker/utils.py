@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -399,9 +400,9 @@ def allocate_kv_cache(
     if not kv_cache_config.kv_cache_tensors:
         return {}
 
-    from vllm.distributed.pp_reconfigure.cache import allocate_stacked_cache, enabled
+    if envs.VLLM_PP_RECONFIGURE_ONLINE:
+        from vllm.distributed.pp_reconfigure.cache import allocate_stacked_cache
 
-    if enabled():
         return allocate_stacked_cache(kv_cache_config, device, kernel_block_sizes)
 
     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
