@@ -96,10 +96,10 @@ def live_migration(base, payload, boundary, expected):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:26010")
-    parser.add_argument("--model", default="molink-tiny")
+    parser.add_argument("--model", default="pp-reconfigure-test")
     parser.add_argument(
         "--output",
-        default="/workspace/molink-reconfiguration-results/acceptance/continuity.log",
+        default="benchmark_results/pp_reconfigure/acceptance/continuity.log",
     )
     args = parser.parse_args()
     payload = {

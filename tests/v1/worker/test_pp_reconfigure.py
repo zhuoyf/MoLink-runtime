@@ -502,9 +502,9 @@ def test_dirty_drain_keeps_later_writes_and_coalesces_overwrites():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("block_size", [16, 64])
 @pytest.mark.parametrize("factor", [1, 2, 4, 8])
-@pytest.mark.parametrize("pipelive", [False, True])
+@pytest.mark.parametrize("online_reconfiguration", [False, True])
 def test_initial_kv_plan_respects_physical_stacked_budget(
-    monkeypatch, block_size, factor, pipelive
+    monkeypatch, block_size, factor, online_reconfiguration
 ):
     """Automatic planning must fit the allocator's real storage, including padding."""
     from vllm.distributed.pp_reconfigure.cache import StackedKVCache
@@ -515,8 +515,10 @@ def test_initial_kv_plan_respects_physical_stacked_budget(
         KVCacheLayout,
     )
 
-    monkeypatch.setenv("HETVLLM_PIPELIVE", "1" if pipelive else "0")
-    monkeypatch.setenv("HETVLLM_PIPELIVE_STACK", str(factor))
+    monkeypatch.setenv(
+        "VLLM_PP_RECONFIGURE_ONLINE", "1" if online_reconfiguration else "0"
+    )
+    monkeypatch.setenv("VLLM_PP_RECONFIGURE_STACK_SIZE", str(factor))
     spec = FullAttentionSpec(
         block_size=block_size, num_kv_heads=32, head_size=128, dtype=torch.float16
     )
@@ -532,7 +534,7 @@ def test_initial_kv_plan_respects_physical_stacked_budget(
     planned = get_kv_cache_config_from_groups(
         config, [KVCacheGroupSpec(names, spec)], budget
     )
-    if not pipelive:
+    if not online_reconfiguration:
         assert planned.num_blocks == (16 if block_size == 16 else 4)
         return
     pool = StackedKVCache(
@@ -555,7 +557,7 @@ def test_inference_marks_optional_block_copies_without_advancing_token_count(
     live.log_dir = None
     live.bitmap = DirtyBitmap(64)
     handle = torch.empty(0)
-    handle._pipelive = (
+    handle._pp_reconfigure = (
         SimpleNamespace(
             last_slots=torch.tensor([1, 3, -1]), spec=SimpleNamespace(block_size=16)
         ),
@@ -581,7 +583,7 @@ def test_receiver_rejects_migration_until_inference_completes(in_flight):
 
     channel = MigrationChannel.__new__(MigrationChannel)
     channel.mutex = threading.Lock()
-    channel.group = SimpleNamespace(pipelive_pending=Mock(query=lambda: False))
+    channel.group = SimpleNamespace(pp_reconfigure_pending=Mock(query=lambda: False))
     if in_flight == "host":
         channel.mutex.acquire()
     channel.receive_control = lambda: {"op": "ACK"}
@@ -606,7 +608,7 @@ def test_channel_accounts_for_rejection_and_each_sender_wait():
     channel = MigrationChannel.__new__(MigrationChannel)
     channel.mutex = threading.RLock()
     channel.timings_ms = defaultdict(float)
-    channel.group = SimpleNamespace(rank_in_group=0, pipelive_pending=Mock())
+    channel.group = SimpleNamespace(rank_in_group=0, pp_reconfigure_pending=Mock())
     channel.stream, channel.comm = Mock(), Mock()
     channel.send_control = Mock()
     channel.receive_control = Mock(
@@ -649,13 +651,13 @@ def test_inference_metadata_wait_does_not_reserve_migration_nccl(monkeypatch):
     group.use_cpu_custom_send_recv = False
     group.device_group = group.cpu_group = None
     group.device = torch.device("cuda:0")
-    group.pipelive_mutex = threading.Lock()
+    group.pp_reconfigure_mutex = threading.Lock()
     entered = []
 
     def metadata(src):
         assert src == 0
-        assert group.pipelive_mutex.acquire(blocking=False)
-        group.pipelive_mutex.release()
+        assert group.pp_reconfigure_mutex.acquire(blocking=False)
+        group.pp_reconfigure_mutex.release()
         entered.append(True)
         return [("marker", 42)]
 
@@ -665,15 +667,15 @@ def test_inference_metadata_wait_does_not_reserve_migration_nccl(monkeypatch):
     event = object()
 
     def record_event():
-        assert group.pipelive_mutex.locked()
+        assert group.pp_reconfigure_mutex.locked()
         return event
 
     monkeypatch.setattr(
         torch.cuda, "current_stream", lambda device: Mock(record_event=record_event)
     )
     assert group.recv_tensor_dict() == {"marker": 42}
-    assert entered == [True] and group.pipelive_pending is event
-    assert not group.pipelive_mutex.locked()
+    assert entered == [True] and group.pp_reconfigure_pending is event
+    assert not group.pp_reconfigure_mutex.locked()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -790,7 +792,7 @@ def test_history_manifest_keeps_live_shared_prefixes_and_excludes_unused_blocks(
     pool = SimpleNamespace(
         blocks=blocks,
         cached_block_hashes_by_block={4: {b"shared-alias"}},
-        _pipelive_disabled={6},
+        _pp_disabled_blocks={6},
     )
     assert required_migration_blocks(pool) == [1, 2, 3, 4]
     blocks[1].ref_cnt = 0
@@ -947,7 +949,9 @@ def test_history_only_mode_defers_dirty_patches_until_final_sync():
         moving=[0],
         kv_ready=False,
         old_kv={
-            "model.layers.0.self_attn.attn": SimpleNamespace(_pipelive=(pool, None))
+            "model.layers.0.self_attn.attn": SimpleNamespace(
+                _pp_reconfigure=(pool, None)
+            )
         },
     )
     live.history_block_ids = [1]
@@ -1006,9 +1010,9 @@ def test_reused_block_is_fully_dirtied_without_changing_convergence_watermark():
             ]
         ),
     )
-    live.before_step(SimpleNamespace(pipelive_block_generations=[0, 2, 1]))
+    live.before_step(SimpleNamespace(pp_block_generations=[0, 2, 1]))
     assert live.bitmap.drain() == (list(range(16, 32)), 0)
-    live.before_step(SimpleNamespace(pipelive_block_generations=[0, 1, 1]))
+    live.before_step(SimpleNamespace(pp_block_generations=[0, 1, 1]))
     assert live.bitmap.drain() == ([], 0)
     assert live.lifecycle.generations == [0, 2, 1]
 
@@ -1147,7 +1151,7 @@ async def test_async_streams_before_pause_and_syncs_before_commit(
             action = args[0]
             for worker in workers:
                 worker.update(
-                    pipelive=True,
+                    online_reconfiguration=True,
                     source=0,
                     max_intermediate_blocks=64,
                     max_final_blocks=64,
@@ -1265,7 +1269,7 @@ def test_resize_commits_scheduler_only_after_all_workers_prepare(failure):
         ]
 
     core.collective_rpc = Mock(side_effect=rpc)
-    with patch.dict("os.environ", {"HETVLLM_PIPELIVE": "1"}):
+    with patch.dict("os.environ", {"VLLM_PP_RECONFIGURE_ONLINE": "1"}):
         if failure:
             with pytest.raises(RuntimeError):
                 core.molink_resize_kv(4)
@@ -1361,7 +1365,7 @@ def test_finalize_retains_old_weights_until_post_resume_cleanup(monkeypatch, def
 
     from vllm.distributed.pp_reconfigure.live import LiveLayerMigration
 
-    monkeypatch.setenv("HETVLLM_PIPELIVE_DEFER_CLEANUP", "1" if defer else "0")
+    monkeypatch.setenv("VLLM_PP_RECONFIGURE_DEFER_CLEANUP", "1" if defer else "0")
 
     class OldLayer:
         pass
@@ -1409,7 +1413,7 @@ async def test_pending_kv_updates_prevent_commit(tmp_path, pending):
                 return workers
             for w in workers:
                 w.update(
-                    pipelive=True,
+                    online_reconfiguration=True,
                     source=0,
                     max_intermediate_blocks=64,
                     max_final_blocks=64,
@@ -1460,7 +1464,11 @@ async def test_insufficient_migration_budget_rejected_before_mutation(tmp_path):
         async def call_utility_async(self, method, *args):
             workers = await super().call_utility_async(method, *args)
             for w in workers:
-                w.update(pipelive=True, max_intermediate_blocks=0, max_final_blocks=0)
+                w.update(
+                    online_reconfiguration=True,
+                    max_intermediate_blocks=0,
+                    max_final_blocks=0,
+                )
             return workers
 
     engine = NoCapacityEngine()

@@ -42,7 +42,7 @@ def plot(report_path, output):
     )
     fig.patch.set_facecolor("#f8fafc")
     fig.suptitle(
-        "MoLink: measured stop-the-world reconfiguration",
+        "Pipeline reconfiguration: measured synchronous migration",
         fontsize=21,
         fontweight="bold",
         y=0.98,
@@ -51,8 +51,7 @@ def plot(report_path, output):
     fig.text(
         0.5,
         0.932,
-        "Llama-2-7B | 2 x RTX 3090 Ti | BF16 + NIXL UCX | "
-        "128 output tokens match baseline",
+        "Token continuity and measured migration phases",
         ha="center",
         color="#52647a",
         fontsize=11,
@@ -177,16 +176,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--report",
         type=Path,
-        default=Path(
-            "/workspace/molink-reconfiguration-results/acceptance/llama7b-v2.log"
-        ),
+        default=Path("benchmark_results/pp_reconfigure/acceptance/llama7b-v2.log"),
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path(
-            "/workspace/molink-reconfiguration-results/plots/reconfiguration-timeline"
-        ),
+        default=Path("benchmark_results/pp_reconfigure/plots/reconfiguration-timeline"),
     )
     args = parser.parse_args()
     plot(args.report, args.output)

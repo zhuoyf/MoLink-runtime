@@ -602,7 +602,7 @@ class TritonAttentionImpl(AttentionImpl):
         # Per-token-head quantized KV cache: handled by the core unified
         # kernel, which dequantizes per-(token, head) inline via constexpr
         # branches (INT8 / FP8) and dispatches to the packed INT4 kernel.
-        address_cache = getattr(kv_cache, "_pipelive", None)
+        address_cache = getattr(kv_cache, "_pp_reconfigure", None)
         if address_cache is not None:
             pool, name = address_cache
             key_cache, value_cache = pool.key_value(name)
@@ -771,7 +771,7 @@ class TritonAttentionImpl(AttentionImpl):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
             return
-        address_cache = getattr(kv_cache, "_pipelive", None)
+        address_cache = getattr(kv_cache, "_pp_reconfigure", None)
         if address_cache is not None:
             pool, name = address_cache
             pool.last_slots = slot_mapping

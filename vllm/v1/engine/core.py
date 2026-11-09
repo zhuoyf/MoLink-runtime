@@ -259,7 +259,7 @@ class EngineCore:
         if (
             os.environ.get(
                 "HETVLLM_RESOURCE_MONITOR",
-                os.environ.get("HETVLLM_PP_RECONFIGURE", "0"),
+                "1" if envs.VLLM_PP_RECONFIGURE_ENABLED else "0",
             )
             == "1"
         ):
@@ -1084,7 +1084,7 @@ class EngineCore:
             raise ValueError("migration requires a completed keep pause")
         if (
             action in ("start_live", "start_history", "load_and_transfer")
-            and os.environ.get("HETVLLM_PIPELIVE") == "1"
+            and envs.VLLM_PP_RECONFIGURE_ONLINE
         ):
             from vllm.distributed.pp_reconfigure.resize import required_migration_blocks
             from vllm.v1.core.sched.scheduler import Scheduler
@@ -1114,8 +1114,10 @@ class EngineCore:
         )
         from vllm.v1.core.sched.scheduler import Scheduler
 
-        if os.environ.get("HETVLLM_PIPELIVE") != "1":
-            raise ValueError("KV resizing requires HETVLLM_PIPELIVE=1 at startup")
+        if not envs.VLLM_PP_RECONFIGURE_ONLINE:
+            raise ValueError(
+                "KV resizing requires VLLM_PP_RECONFIGURE_ONLINE=1 at startup"
+            )
         scheduler = cast(Scheduler, self.scheduler)
         manager = scheduler.kv_cache_manager
         pool = manager.block_pool

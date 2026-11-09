@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""PipeLive §5: independently allocated, layer-stacked KV blocks."""
+"""Address-based KV storage: independently allocated, layer-stacked KV blocks."""
 
 import math
-import os
 
 import torch
 
+import vllm.envs as envs
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 
 def enabled():
-    return os.environ.get("HETVLLM_PIPELIVE") == "1"
+    return envs.VLLM_PP_RECONFIGURE_ONLINE
 
 
 class StackedKVCache:
@@ -23,7 +23,9 @@ class StackedKVCache:
 
     def __init__(self, names, spec, num_blocks, device, stack_factor=2):
         if type(spec) is not FullAttentionSpec or spec.kv_quant_mode != 0:
-            raise ValueError("PipeLive requires uniform, unquantized full attention")
+            raise ValueError(
+                "Online migration requires uniform, unquantized full attention"
+            )
         indices = [int(name.split(".")[2]) for name in names]
         if (
             stack_factor < 1
@@ -31,7 +33,9 @@ class StackedKVCache:
             or indices != list(range(indices[0], indices[0] + len(indices)))
             or indices[0] % stack_factor
         ):
-            raise ValueError("PipeLive layer ranges must align to the stacking factor")
+            raise ValueError(
+                "Online migration layer ranges must align to the stacking factor"
+            )
         self.names = names
         self.locations = {name: index for index, name in enumerate(names)}
         self.group_ids = set(range(len(names) // stack_factor))
@@ -47,7 +51,7 @@ class StackedKVCache:
         self.handles = {}
         for name in names:
             handle = torch.zeros(num_blocks, dtype=torch.int64, device=device)
-            handle._pipelive = (self, name)
+            handle._pp_reconfigure = (self, name)
             self.handles[name] = handle
         self.add_blocks(range(num_blocks))
 
@@ -123,15 +127,17 @@ class StackedKVCache:
 
 def allocate_stacked_cache(config, device, kernel_block_sizes):
     if len(config.kv_cache_groups) != 1:
-        raise ValueError("PipeLive requires a single full-attention KV group")
+        raise ValueError("Online migration requires a single full-attention KV group")
     group = config.kv_cache_groups[0]
     if kernel_block_sizes != [group.kv_cache_spec.block_size]:
-        raise ValueError("PipeLive requires matching kernel and scheduler block sizes")
+        raise ValueError(
+            "Online migration requires matching kernel and scheduler block sizes"
+        )
     pool = StackedKVCache(
         group.layer_names,
         group.kv_cache_spec,
         config.num_blocks,
         device,
-        int(os.environ.get("HETVLLM_PIPELIVE_STACK", "2")),
+        envs.VLLM_PP_RECONFIGURE_STACK_SIZE,
     )
     return pool.handles

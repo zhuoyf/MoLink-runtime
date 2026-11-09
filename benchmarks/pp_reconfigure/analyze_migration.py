@@ -107,7 +107,7 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     lines = [
-        "# PipeLive GPU 0 → GPU 1 comparison",
+        "# Online pipeline reconfiguration GPU 0 → GPU 1 comparison",
         "",
         "Means of paired runs; complete per-trial data is in the comparison JSON.",
         "",
@@ -167,7 +167,7 @@ def main():
     )
     axes[1].set_ylabel("Forward-span overlap (%)")
     axes[1].set_ylim(0, 100)
-    figure.suptitle("PipeLive: Llama-2-7B, PP 20/12 -> 18/14")
+    figure.suptitle("Pipeline reconfiguration: measured migration costs")
     figure.tight_layout()
     figure.savefig(output / "comparison.svg")
     figure.savefig(output / "comparison.png", dpi=160)

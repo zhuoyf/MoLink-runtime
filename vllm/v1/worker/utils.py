@@ -135,7 +135,7 @@ class KVBlockZeroer:
         Only AttentionSpec layers are processed; Mamba layers are skipped.
         """
         self.device = device
-        self._pipelive_pools = set()
+        self._pp_reconfigure_pools = set()
         self._meta: (
             tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int, int] | None
         ) = None
@@ -166,8 +166,8 @@ class KVBlockZeroer:
                 kv = static_forward_context[layer_name].kv_cache
                 if not isinstance(kv, torch.Tensor):
                     continue
-                if hasattr(kv, "_pipelive"):
-                    self._pipelive_pools.add(kv._pipelive[0])
+                if hasattr(kv, "_pp_reconfigure"):
+                    self._pp_reconfigure_pools.add(kv._pp_reconfigure[0])
                     continue
                 dp = kv.data_ptr()
 
@@ -223,7 +223,7 @@ class KVBlockZeroer:
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
-        for pool in self._pipelive_pools:
+        for pool in self._pp_reconfigure_pools:
             for block_id in block_ids:
                 for stack in pool.stacks[block_id].values():
                     stack.zero_()
@@ -669,8 +669,8 @@ def copy_kv_cache_blocks_inplace(
     seen: set[tuple[torch.device, int]] = set()
     copied_storages: set[tuple[torch.device, int]] = set()
     for cache in kv_caches:
-        if hasattr(cache, "_pipelive"):
-            pool, name = cache._pipelive
+        if hasattr(cache, "_pp_reconfigure"):
+            pool, name = cache._pp_reconfigure
             for src_block_id, dst_block_id in kv_cache_block_copies:
                 pool.block(name, dst_block_id).copy_(pool.block(name, src_block_id))
             continue

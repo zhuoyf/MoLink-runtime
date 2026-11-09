@@ -97,7 +97,7 @@ class ReconfigurationController:
                     raise ReconfigurationValidationError("engine is already paused")
                 descriptions = await phase("validate", lambda: rpc("describe"))
                 resize_restore = None
-                if all(w.get("pipelive") for w in descriptions):
+                if all(w.get("online_reconfiguration") for w in descriptions):
                     shrink = min(w["max_intermediate_blocks"] for w in descriptions)
                     resize_restore = min(w["max_final_blocks"] for w in descriptions)
                     if shrink < 2 or resize_restore < 2:
@@ -112,9 +112,10 @@ class ReconfigurationController:
                             ),
                         )
                 if mode != "sync":
-                    if not all(w.get("pipelive") for w in descriptions):
+                    if not all(w.get("online_reconfiguration") for w in descriptions):
                         raise ReconfigurationValidationError(
-                            "async migration requires HETVLLM_PIPELIVE=1 at startup"
+                            "async migration requires "
+                            "VLLM_PP_RECONFIGURE_ONLINE=1 at startup"
                         )
                     background_started = True
                     await phase("prepare_live", lambda: rpc("prepare_live"))
@@ -173,7 +174,7 @@ class ReconfigurationController:
                     parallel = await phase(
                         "load_and_transfer", lambda: rpc("load_and_transfer")
                     )
-                    if all(w.get("pipelive") for w in descriptions):
+                    if all(w.get("online_reconfiguration") for w in descriptions):
                         live_stats = parallel
                 if live_stats is not None:
                     source = next(w for w in live_stats if w["stage"] == w["source"])

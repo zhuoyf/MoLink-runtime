@@ -106,8 +106,8 @@ class StageMonitor:
         runner = worker.model_runner
         config = runner.kv_cache_config
         capacity = sum(t.size for t in config.kv_cache_tensors[:1])
-        if runner.kv_caches and hasattr(runner.kv_caches[0], "_pipelive"):
-            pools = {cache._pipelive[0] for cache in runner.kv_caches}
+        if runner.kv_caches and hasattr(runner.kv_caches[0], "_pp_reconfigure"):
+            pools = {cache._pp_reconfigure[0] for cache in runner.kv_caches}
             capacity = sum(pool.allocated_bytes for pool in pools)
         decoder = getattr(runner.get_model(), "model", None)
         properties = torch.cuda.get_device_properties(worker.device)

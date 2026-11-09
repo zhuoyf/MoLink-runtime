@@ -62,9 +62,7 @@ class LayerMigration:
         self.config = worker.vllm_config
         self.stage = get_pp_group().rank_in_group
         self.prepared: Prepared | None = None
-        self.weight_cache = CPUWeightCache(
-            int(os.environ.get("HETVLLM_PIPELIVE_WEIGHT_CACHE_BYTES", "0"))
-        )
+        self.weight_cache = CPUWeightCache(envs.VLLM_PP_RECONFIGURE_WEIGHT_CACHE_BYTES)
 
     @property
     def model(self):
@@ -74,9 +72,9 @@ class LayerMigration:
         config = self.config
         from vllm.model_executor.models.llama import LlamaForCausalLM
 
-        if os.environ.get("HETVLLM_PP_RECONFIGURE") != "1":
+        if not envs.VLLM_PP_RECONFIGURE_ENABLED:
             raise ReconfigurationValidationError(
-                "set HETVLLM_PP_RECONFIGURE=1 on every worker"
+                "set VLLM_PP_RECONFIGURE_ENABLED=1 on every worker"
             )
         parallel = config.parallel_config
         if (
@@ -107,10 +105,10 @@ class LayerMigration:
             )
         if groups[0].kv_cache_spec.kv_quant_mode != 0:
             raise ReconfigurationValidationError("prototype requires unquantized KV")
-        backend = os.environ.get("HETVLLM_PP_KV_TRANSPORT", "nixl")
+        backend = envs.VLLM_PP_RECONFIGURE_KV_TRANSPORT
         if backend not in ("nixl", "pp"):
             raise ReconfigurationValidationError(
-                "HETVLLM_PP_KV_TRANSPORT must be nixl or pp"
+                "VLLM_PP_RECONFIGURE_KV_TRANSPORT must be nixl or pp"
             )
         local_weight_files(config)
         start, end = layer_range(

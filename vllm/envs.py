@@ -48,6 +48,15 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
+    VLLM_PP_RECONFIGURE_ENABLED: bool = False
+    VLLM_PP_RECONFIGURE_ONLINE: bool = False
+    VLLM_PP_RECONFIGURE_STACK_SIZE: int = 2
+    VLLM_PP_RECONFIGURE_WEIGHT_CACHE_BYTES: int = 0
+    VLLM_PP_RECONFIGURE_PROFILE: bool = False
+    VLLM_PP_RECONFIGURE_PROFILE_CPU: bool = False
+    VLLM_PP_RECONFIGURE_DEFER_CLEANUP: bool = True
+    VLLM_PP_RECONFIGURE_KV_TRANSPORT: str = "nixl"
+    VLLM_PP_RECONFIGURE_LOG_DIR: str = "pp_reconfigure_logs"
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -860,6 +869,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+    # Pipeline reconfiguration and online KV migration.
+    "VLLM_PP_RECONFIGURE_ENABLED": lambda: os.getenv("VLLM_PP_RECONFIGURE_ENABLED", "0")
+    == "1",
+    "VLLM_PP_RECONFIGURE_ONLINE": lambda: os.getenv("VLLM_PP_RECONFIGURE_ONLINE", "0")
+    == "1",
+    "VLLM_PP_RECONFIGURE_STACK_SIZE": lambda: int(
+        os.getenv("VLLM_PP_RECONFIGURE_STACK_SIZE", "2")
+    ),
+    "VLLM_PP_RECONFIGURE_WEIGHT_CACHE_BYTES": lambda: int(
+        os.getenv("VLLM_PP_RECONFIGURE_WEIGHT_CACHE_BYTES", "0")
+    ),
+    "VLLM_PP_RECONFIGURE_PROFILE": lambda: os.getenv("VLLM_PP_RECONFIGURE_PROFILE", "0")
+    == "1",
+    "VLLM_PP_RECONFIGURE_PROFILE_CPU": lambda: os.getenv(
+        "VLLM_PP_RECONFIGURE_PROFILE_CPU", "0"
+    )
+    == "1",
+    "VLLM_PP_RECONFIGURE_DEFER_CLEANUP": lambda: os.getenv(
+        "VLLM_PP_RECONFIGURE_DEFER_CLEANUP", "1"
+    )
+    != "0",
+    "VLLM_PP_RECONFIGURE_KV_TRANSPORT": lambda: os.getenv(
+        "VLLM_PP_RECONFIGURE_KV_TRANSPORT", "nixl"
+    ),
+    "VLLM_PP_RECONFIGURE_LOG_DIR": lambda: os.getenv(
+        "VLLM_PP_RECONFIGURE_LOG_DIR", "pp_reconfigure_logs"
+    ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: (

@@ -408,7 +408,7 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
-        if os.environ.get("HETVLLM_PIPELIVE") == "1" and (
+        if envs.VLLM_PP_RECONFIGURE_ONLINE and (
             not self.use_v2_model_runner
             or not self.model_config.enforce_eager
             or self.vllm_config.attention_config.backend is None
@@ -422,7 +422,7 @@ class Worker(WorkerBase):
             != (2, 1, 1)
         ):
             raise ValueError(
-                "PipeLive requires eager MRv2, TRITON_ATTN, NCCL PP=2/TP=DP=1"
+                "Online migration requires eager MRv2, TRITON_ATTN, NCCL PP=2/TP=DP=1"
             )
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
@@ -813,11 +813,11 @@ class Worker(WorkerBase):
             ),
         )
 
-        if os.environ.get("HETVLLM_PIPELIVE") == "1":
+        if envs.VLLM_PP_RECONFIGURE_ONLINE:
             from vllm.distributed.pp_reconfigure.live import LiveLayerMigration
 
-            self._pipelive = LiveLayerMigration(self)
-            self._molink_migration = self._pipelive
+            self._pp_reconfigure = LiveLayerMigration(self)
+            self._molink_migration = self._pp_reconfigure
 
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
@@ -833,7 +833,7 @@ class Worker(WorkerBase):
         if (
             os.environ.get(
                 "HETVLLM_RESOURCE_MONITOR",
-                os.environ.get("HETVLLM_PP_RECONFIGURE", "0"),
+                "1" if envs.VLLM_PP_RECONFIGURE_ENABLED else "0",
             )
             == "1"
         ):
@@ -1402,8 +1402,7 @@ class Worker(WorkerBase):
         _monitor = None
         _monitor_events = None
         if forward_pass and (
-            hasattr(self, "_molink_monitor")
-            or os.environ.get("HETVLLM_PP_RECONFIGURE") == "1"
+            hasattr(self, "_molink_monitor") or envs.VLLM_PP_RECONFIGURE_ENABLED
         ):
             if not hasattr(self, "_molink_monitor"):
                 from vllm.distributed.pp_reconfigure.monitor import StageMonitor
@@ -1412,7 +1411,7 @@ class Worker(WorkerBase):
             _monitor = self._molink_monitor
             _monitor_events = _monitor.begin()
         with self.annotate_profile(scheduler_output):
-            if live := getattr(self, "_pipelive", None):
+            if live := getattr(self, "_pp_reconfigure", None):
                 live.begin_compute()
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors

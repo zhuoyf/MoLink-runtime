@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""PipeLive §6.1 asymmetric TCP entry protocol for overlapping NCCL groups."""
+"""Online migration: asymmetric TCP entry protocol for overlapping NCCL groups."""
 
 import functools
 import json
@@ -16,11 +16,11 @@ import torch
 def serialize_inference_nccl(operation):
     @functools.wraps(operation)
     def call(group, *args, **kwargs):
-        mutex = getattr(group, "pipelive_mutex", None)
+        mutex = getattr(group, "pp_reconfigure_mutex", None)
         if mutex is None:
             return operation(group, *args, **kwargs)
         with mutex:
-            if pending := getattr(group, "pipelive_pending", None):
+            if pending := getattr(group, "pp_reconfigure_pending", None):
                 pending.synchronize()
             result = operation(group, *args, **kwargs)
             handles = []
@@ -35,7 +35,7 @@ def serialize_inference_nccl(operation):
                 handle.wait()
             # Reserve GPU entry until completion while allowing the worker to
             # enqueue computation. Every inference/migration entry checks it.
-            group.pipelive_pending = torch.cuda.current_stream(
+            group.pp_reconfigure_pending = torch.cuda.current_stream(
                 group.device
             ).record_event()
             return result
@@ -52,11 +52,13 @@ class MigrationChannel:
         self.group = group
         self.device = device
         self.mutex = threading.RLock()
-        group.pipelive_mutex = self.mutex
+        group.pp_reconfigure_mutex = self.mutex
         self.stream = torch.cuda.Stream(device=device, priority=0)
         self.comm = PyNcclCommunicator(group.cpu_group, device)
         if not self.comm.available or self.comm.disabled:
-            raise ValueError("PipeLive requires an available PyNccl communicator")
+            raise ValueError(
+                "Online migration requires an available PyNccl communicator"
+            )
         listener = socket.socket()
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(("0.0.0.0", 0))
@@ -88,7 +90,9 @@ class MigrationChannel:
     def receive_control(self):
         line = self.reader.readline(16 << 20)
         if not line or not line.endswith(b"\n"):
-            raise ConnectionError("PipeLive control channel closed or oversized frame")
+            raise ConnectionError(
+                "Online migration control channel closed or oversized frame"
+            )
         return json.loads(line)
 
     def send(self, tensor, metadata):
@@ -99,7 +103,7 @@ class MigrationChannel:
                 self.timings_ms["communication_lock_wait"] += (
                     acquired - started
                 ) * 1000
-                if pending := getattr(self.group, "pipelive_pending", None):
+                if pending := getattr(self.group, "pp_reconfigure_pending", None):
                     pending.synchronize()
                 pending_done = time.perf_counter()
                 self.timings_ms["inference_nccl_wait"] += (
@@ -153,7 +157,7 @@ class MigrationChannel:
             self.send_control({"op": "REJECT"})
             return True
         try:
-            pending = getattr(self.group, "pipelive_pending", None)
+            pending = getattr(self.group, "pp_reconfigure_pending", None)
             if pending is not None and not pending.query():
                 self.send_control({"op": "REJECT"})
                 return True

@@ -23,7 +23,7 @@ def main():
     parser.add_argument("--url", default="http://127.0.0.1:26010")
     parser.add_argument(
         "--output",
-        default="/workspace/molink-reconfiguration-results/monitoring/resource-sync",
+        default="benchmark_results/pp_reconfigure/monitoring/resource-sync",
     )
     args = parser.parse_args()
     before = read_state(args.url)

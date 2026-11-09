@@ -225,12 +225,11 @@ def main():
         (pause - start) * 1000, (resume - start) * 1000, color="#fecaca", alpha=0.6
     )
     ax.set_xlabel("Time from background migration start (ms)")
-    ax.set_ylabel("Polled migration-relative tokens (all 3 requests)")
+    ax.set_ylabel("Polled migration-relative tokens (all requests)")
     ax.set_title(f"D. Incremental patches catch up; final lag = 0 ({len(last)} rounds)")
     ax.legend(fontsize=8)
     fig.suptitle(
-        "PipeLive live KV migration | Llama-2-7B FP16 | 2 x RTX 3090 Ti\n"
-        "PP 20/12 -> 18/14 | 3 requests x 192 exact tokens",
+        "Online pipeline reconfiguration: token delivery and migration costs",
         fontsize=15,
     )
     output = Path(args.output_dir)
@@ -239,10 +238,9 @@ def main():
         fig.savefig(output / f"experiment.{extension}", dpi=170)
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     lines = [
-        "# PipeLive 可视化验证实验",
+        "# Online pipeline reconfiguration 可视化验证实验",
         "",
-        "配置：Llama-2-7B FP16，双 RTX 3090 Ti，PP 20/12 → 18/14，"
-        "迁移第 18–19 层；三个活跃请求，每个生成 192 tokens。",
+        f"目标边界：{args.target}；请求和采样配置见输入 comparison JSON。",
         "",
         "第一轮完整往返作为预热；下表来自后续正向迁移，哈希校验单独运行。",
         "",
@@ -287,8 +285,7 @@ def main():
         "同时执行的 GPU kernel 比例需要独立 CUPTI 实验。"
         "KV 分配量为存活 stack tensor 的大小，PyTorch reserved 显存可能保持不变。",
         "",
-        "容器使用现有 NCCL SHM 重定向和 CPU ring 大小适配，"
-        "启动参数见 ../server.log；复现实验命令见仓库 docs/design/pipelive.md。",
+        "使用方法见仓库 docs/design/pp_reconfiguration.md。",
     ]
     (output / "report.md").write_text("\n".join(lines) + "\n")
     print(json.dumps(summary, indent=2))

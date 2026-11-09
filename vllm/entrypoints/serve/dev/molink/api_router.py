@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
-import os
 from typing import Literal
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
 from pydantic import BaseModel, StrictInt
 
+import vllm.envs as envs
 from vllm.distributed.pp_reconfigure.control import ReconfigurationController
 from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
 
@@ -28,10 +28,7 @@ def controller(request):
     if not hasattr(request.app.state, "molink_controller"):
         request.app.state.molink_controller = ReconfigurationController(
             request.app.state.engine_client,
-            os.environ.get(
-                "HETVLLM_PP_RECONFIGURE_LOG",
-                "/workspace/molink-reconfiguration-results/migrations",
-            ),
+            envs.VLLM_PP_RECONFIGURE_LOG_DIR,
         )
     return request.app.state.molink_controller
 
@@ -80,5 +77,5 @@ async def resize_kv(body: ResizeRequest, request: Request):
 
 
 def attach_router(app: FastAPI):
-    if os.environ.get("HETVLLM_PP_RECONFIGURE") == "1":
+    if envs.VLLM_PP_RECONFIGURE_ENABLED:
         app.include_router(router)

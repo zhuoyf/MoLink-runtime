@@ -124,13 +124,13 @@ def trial(
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:26020")
-    parser.add_argument("--model", default="molink-tiny")
+    parser.add_argument("--model", default="pp-reconfigure-test")
     parser.add_argument("--iterations", type=int, default=1)
     parser.add_argument("--boundaries", type=int, nargs=2, default=[6, 8])
     parser.add_argument("--verify-kv", action="store_true")
     parser.add_argument(
         "--output",
-        default="/workspace/molink-reconfiguration-results/pipelive/comparison.json",
+        default="benchmark_results/pp_reconfigure/comparison.json",
     )
     args = parser.parse_args()
     payload = {

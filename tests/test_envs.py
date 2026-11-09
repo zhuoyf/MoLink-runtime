@@ -587,3 +587,25 @@ class TestVllmMaxNSequences:
 
         with pytest.raises(VLLMValidationError, match="n must be at most 128"):
             SamplingParams(n=129)
+
+
+@pytest.mark.parametrize(
+    "suffix,default,override,expected",
+    [
+        ("ENABLED", False, "1", True),
+        ("ONLINE", False, "1", True),
+        ("STACK_SIZE", 2, "4", 4),
+        ("WEIGHT_CACHE_BYTES", 0, "1048576", 1048576),
+        ("PROFILE", False, "1", True),
+        ("PROFILE_CPU", False, "1", True),
+        ("DEFER_CLEANUP", True, "0", False),
+        ("KV_TRANSPORT", "nixl", "pp", "pp"),
+        ("LOG_DIR", "pp_reconfigure_logs", "/tmp/migrations", "/tmp/migrations"),
+    ],
+)
+def test_pp_reconfigure_envs(monkeypatch, suffix, default, override, expected):
+    name = f"VLLM_PP_RECONFIGURE_{suffix}"
+    monkeypatch.delenv(name, raising=False)
+    assert getattr(envs, name) == default
+    monkeypatch.setenv(name, override)
+    assert getattr(envs, name) == expected

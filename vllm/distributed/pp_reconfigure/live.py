@@ -1,16 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""PipeLive worker primitives, retaining MoLink's layer binding and recovery."""
+"""Worker primitives for online layer migration and recovery."""
 
 import copy
 import gc
 import hashlib
-import os
 import threading
 import time
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import set_current_vllm_config
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.distributed.pp_reconfigure.cache import StackedKVCache
@@ -58,17 +58,19 @@ class LiveLayerMigration(LayerMigration):
     def describe(self, boundary):
         self._wait_cleanup()
         result = super().describe(boundary)
-        k = int(os.environ.get("HETVLLM_PIPELIVE_STACK", "2"))
+        k = envs.VLLM_PP_RECONFIGURE_STACK_SIZE
         if boundary % k or result["old_boundary"] % k:
             raise ReconfigurationValidationError(
-                "boundary must align to PipeLive stacking factor"
+                "boundary must align to the layer stacking factor"
             )
-        if not all(hasattr(cache, "_pipelive") for cache in self.runner.kv_caches):
+        if not all(
+            hasattr(cache, "_pp_reconfigure") for cache in self.runner.kv_caches
+        ):
             raise ReconfigurationValidationError(
-                "PipeLive requires address-based caches at startup"
+                "Online migration requires address-based caches at startup"
             )
-        result["pipelive"] = True
-        pools = {cache._pipelive[0] for cache in self.runner.kv_caches}
+        result["online_reconfiguration"] = True
+        pools = {cache._pp_reconfigure[0] for cache in self.runner.kv_caches}
         existing = set(self.runner.kv_cache_config.kv_cache_groups[0].layer_names)
         target = {
             f"model.layers.{i}.self_attn.attn"
@@ -238,13 +240,15 @@ class LiveLayerMigration(LayerMigration):
                         new_layers[index] = LlamaDecoderLayer(
                             vllm_config=self.config, prefix=f"model.layers.{index}"
                         )
-                existing_ids = set(next(iter(old_kv.values()))._pipelive[0].stacks)
+                existing_ids = set(
+                    next(iter(old_kv.values()))._pp_reconfigure[0].stacks
+                )
                 incoming = StackedKVCache(
                     [f"model.layers.{i}.self_attn.attn" for i in moving],
                     spec,
                     0,
                     self.worker.device,
-                    int(os.environ.get("HETVLLM_PIPELIVE_STACK", "2")),
+                    envs.VLLM_PP_RECONFIGURE_STACK_SIZE,
                 )
                 incoming.add_blocks(sorted(existing_ids))
             new_context = {name: context[name] for name in names}
@@ -290,7 +294,7 @@ class LiveLayerMigration(LayerMigration):
 
     def start_live(self, log_dir, block_ids=None, generations=None, patching=True):
         tx = self._transaction()
-        pool, _ = next(iter(tx.old_kv.values()))._pipelive
+        pool, _ = next(iter(tx.old_kv.values()))._pp_reconfigure
         self.history_block_ids = sorted(pool.stacks if block_ids is None else block_ids)
         if not set(self.history_block_ids) <= pool.stacks.keys():
             raise ValueError("history block manifest references unallocated KV")
@@ -310,9 +314,9 @@ class LiveLayerMigration(LayerMigration):
         self.channel.rejections = 0
         self.channel.timings_ms.clear()
         self.gpu_profiler = None
-        if os.environ.get("HETVLLM_PIPELIVE_PROFILE") == "1":
+        if envs.VLLM_PP_RECONFIGURE_PROFILE:
             activities = [torch.profiler.ProfilerActivity.CUDA]
-            if os.environ.get("HETVLLM_PIPELIVE_PROFILE_CPU") == "1":
+            if envs.VLLM_PP_RECONFIGURE_PROFILE_CPU:
                 activities.append(torch.profiler.ProfilerActivity.CPU)
             self.gpu_profiler = torch.profiler.profile(activities=activities)
             self.gpu_profiler.start()
@@ -363,7 +367,7 @@ class LiveLayerMigration(LayerMigration):
             self.compute_events = None
 
     def before_step(self, scheduler_output):
-        generations = scheduler_output.pipelive_block_generations
+        generations = scheduler_output.pp_block_generations
         if generations is None:
             raise ValueError("missing scheduler block generations during migration")
         changed = self.lifecycle.observe(generations)
@@ -389,7 +393,7 @@ class LiveLayerMigration(LayerMigration):
         self.step_count += bool(scheduler_output.total_num_scheduled_tokens)
         if self.stage == tx.source and scheduler_output.total_num_scheduled_tokens:
             handle = tx.old_kv[f"model.layers.{tx.moving[0]}.self_attn.attn"]
-            pool, _ = handle._pipelive
+            pool, _ = handle._pp_reconfigure
             slots = pool.last_slots
             slots = slots[slots >= 0].cpu().tolist()
             self.bitmap.mark(slots)
@@ -498,7 +502,9 @@ class LiveLayerMigration(LayerMigration):
 
     def _send_loop(self):
         tx = self._transaction()
-        pool, _ = tx.old_kv[f"model.layers.{tx.moving[0]}.self_attn.attn"]._pipelive
+        pool, _ = tx.old_kv[
+            f"model.layers.{tx.moving[0]}.self_attn.attn"
+        ]._pp_reconfigure
         block_size = pool.spec.block_size
         slots = [
             block * block_size + token
@@ -617,7 +623,7 @@ class LiveLayerMigration(LayerMigration):
         for thread in (self.kv_thread, self.weights_thread):
             thread.join(timeout=60)
             if thread.is_alive():
-                raise TimeoutError("PipeLive background thread did not quiesce")
+                raise TimeoutError("Online migration background thread did not quiesce")
         self.active = False
         torch.accelerator.synchronize(self.worker.device)
         gpu_trace = None
@@ -654,7 +660,7 @@ class LiveLayerMigration(LayerMigration):
         if self.preparing:
             self.prepare_thread.join(timeout=60)
             if self.prepare_thread.is_alive():
-                raise TimeoutError("PipeLive preparation did not quiesce")
+                raise TimeoutError("Online migration preparation did not quiesce")
         if self.active:
             self._quiesce_live()
         return super().rollback()
@@ -663,7 +669,7 @@ class LiveLayerMigration(LayerMigration):
         self._wait_cleanup()
         if self.prepared is not None:
             raise ValueError("cannot resize during KV migration")
-        pools = {cache._pipelive[0] for cache in self.runner.kv_caches}
+        pools = {cache._pp_reconfigure[0] for cache in self.runner.kv_caches}
         for pool in pools:
             if (
                 not set(plan["remove"]) <= pool.stacks.keys()
@@ -715,7 +721,7 @@ class LiveLayerMigration(LayerMigration):
             raise ValueError("cannot finalize before commit")
         self.retired = tx
         self.prepared = None
-        if os.environ.get("HETVLLM_PIPELIVE_DEFER_CLEANUP", "1") == "0":
+        if not envs.VLLM_PP_RECONFIGURE_DEFER_CLEANUP:
             del tx
             self._cleanup_retired()
             if self.cleanup_error:
@@ -748,7 +754,7 @@ class LiveLayerMigration(LayerMigration):
                 if tx is not None:
                     if self.stage == tx.source:
                         names = [f"model.layers.{i}.self_attn.attn" for i in tx.moving]
-                        pools = {tx.old_kv[name]._pipelive[0] for name in names}
+                        pools = {tx.old_kv[name]._pp_reconfigure[0] for name in names}
                         for pool in pools:
                             pool.retire_layers(names)
                     tx.transport.close()

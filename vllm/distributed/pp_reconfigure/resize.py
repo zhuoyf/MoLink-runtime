@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Scheduler half of PipeLive resizing; live logical block IDs stay stable."""
+"""Scheduler-side KV resizing with stable logical block IDs."""
 
 from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -8,7 +8,7 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
 def required_migration_blocks(pool):
     """Retain live requests and reusable prefixes, including shared cached KV."""
-    disabled = getattr(pool, "_pipelive_disabled", set())
+    disabled = getattr(pool, "_pp_disabled_blocks", set())
     cached = pool.cached_block_hashes_by_block
     return [
         block.block_id
@@ -28,7 +28,7 @@ def plan_resize(pool, capacity):
         raise ReconfigurationValidationError(
             "KV capacity must be an integer >= 2 (including null block)"
         )
-    disabled: set[int] = getattr(pool, "_pipelive_disabled", set())
+    disabled: set[int] = getattr(pool, "_pp_disabled_blocks", set())
     delta = capacity - pool.num_gpu_blocks
     if delta < 0:
         free = [
@@ -49,7 +49,7 @@ def plan_resize(pool, capacity):
 
 
 def commit_pool_resize(pool, plan):
-    disabled: set[int] = getattr(pool, "_pipelive_disabled", set())
+    disabled: set[int] = getattr(pool, "_pp_disabled_blocks", set())
     for block_id in plan["remove"]:
         block = pool.blocks[block_id]
         assert block.ref_cnt == 0 and not block.is_null
@@ -62,5 +62,5 @@ def commit_pool_resize(pool, plan):
         else:
             disabled.remove(block_id)
         pool.free_block_queue.append(pool.blocks[block_id])
-    pool._pipelive_disabled = disabled
+    pool._pp_disabled_blocks = disabled
     pool.num_gpu_blocks = plan["capacity"]

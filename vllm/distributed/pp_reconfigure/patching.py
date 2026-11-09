@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""PipeLive §6.1 dirty-slot draining and immutable bounded KV patches."""
+"""Online migration: dirty-slot draining and immutable bounded KV patches."""
 
 import functools
 import threading
@@ -14,7 +14,7 @@ from vllm.triton_utils import tl, triton
 def live_step(operation):
     @functools.wraps(operation)
     def call(worker, *args, **kwargs):
-        live = getattr(worker, "_pipelive", None)
+        live = getattr(worker, "_pp_reconfigure", None)
         if live is None or not live.active:
             return operation(worker, *args, **kwargs)
         with live.cache_lock:
@@ -32,16 +32,16 @@ def live_step(operation):
 def live_sampling(operation):
     @functools.wraps(operation)
     def call(worker, *args, **kwargs):
-        live = getattr(worker, "_pipelive", None)
+        live = getattr(worker, "_pp_reconfigure", None)
         if live is None:
             return operation(worker, *args, **kwargs)
         with live.channel.mutex:
             group = live.channel.group
-            if pending := getattr(group, "pipelive_pending", None):
+            if pending := getattr(group, "pp_reconfigure_pending", None):
                 pending.synchronize()
             result = operation(worker, *args, **kwargs)
             if handler := worker.model_runner.pp_handler:
-                group.pipelive_pending = handler.broadcast_stream.record_event()
+                group.pp_reconfigure_pending = handler.broadcast_stream.record_event()
             return result
 
     return call
@@ -138,7 +138,7 @@ def _copy_slots(
 
 
 def copy_slots(handle, slots, payload=None):
-    pool, _ = handle._pipelive
+    pool, _ = handle._pp_reconfigure
     spec = pool.spec
     indices = torch.tensor(slots, dtype=torch.int64, device=pool.device)
     scatter = payload is not None
