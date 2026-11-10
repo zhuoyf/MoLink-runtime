@@ -340,7 +340,6 @@ class LayerMigration:
                 self.stage, tx.old_boundary, self.model.config.num_hidden_layers
             )
             self._bind(tx.old_context, tx.old_config, tx.old_kv)
-        if tx is not None:
             tx.transport.close()
         self.prepared = None
         del tx

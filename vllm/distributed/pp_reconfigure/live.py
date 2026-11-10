@@ -30,6 +30,8 @@ from vllm.model_executor.models.llama import LlamaDecoderLayer
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 
+MIGRATION_CHUNK_BYTES = 64 << 20
+
 
 class LiveLayerMigration(LayerMigration):
     def __init__(self, worker):
@@ -94,7 +96,9 @@ class LiveLayerMigration(LayerMigration):
         final = len(target) // k * bytes_per_stack
         cap = self.config.cache_config.num_gpu_blocks_override
         result["max_intermediate_blocks"] = max(
-            0, (budget - non_kv - incoming_weights - (32 << 20)) // intermediate
+            0,
+            (budget - non_kv - incoming_weights - (2 * MIGRATION_CHUNK_BYTES))
+            // intermediate,
         )
         result["max_final_blocks"] = max(
             0,
@@ -103,7 +107,7 @@ class LiveLayerMigration(LayerMigration):
                 - non_kv
                 - incoming_weights
                 + len(existing - target) * weight_bytes
-                - (32 << 20)
+                - (2 * MIGRATION_CHUNK_BYTES)
             )
             // final,
         )
@@ -414,7 +418,9 @@ class LiveLayerMigration(LayerMigration):
             * torch.empty((), dtype=spec.dtype).element_size()
         )
         names = [f"model.layers.{i}.self_attn.attn" for i in tx.moving]
-        chunk_slots = max(1, min(16384, (16 << 20) // (slot_bytes * len(names))))
+        chunk_slots = max(
+            1, min(16384, MIGRATION_CHUNK_BYTES // (slot_bytes * len(names)))
+        )
         chunks = [
             slots[i : i + chunk_slots] for i in range(0, len(slots), chunk_slots)
         ] or [[]]
@@ -483,6 +489,7 @@ class LiveLayerMigration(LayerMigration):
                     last=metadata["last"],
                     layers=names,
                 )
+            del payload
         self.applied = watermark
         self.transferred_slots.update(slots)
         self.full_done |= full

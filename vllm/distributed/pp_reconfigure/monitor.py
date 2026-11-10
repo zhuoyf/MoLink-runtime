@@ -37,9 +37,7 @@ class StageMonitor:
     """Nonblocking CUDA event timings; NVML counters are read only on polling."""
 
     def __init__(self):
-        self.pending: deque[tuple[torch.cuda.Event, torch.cuda.Event, float, int]] = (
-            deque()
-        )
+        self.pending: deque[tuple[torch.cuda.Event, torch.cuda.Event, int]] = deque()
         self.samples: deque[dict[str, float | int]] = deque(maxlen=256)
         self.lock = threading.Lock()
         self.request_blocks: dict[str, set[int]] = {}
@@ -56,7 +54,7 @@ class StageMonitor:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        return start, end, time.perf_counter()
+        return start, end
 
     def end(self, events, tokens):
         if events is not None:
@@ -72,7 +70,7 @@ class StageMonitor:
 
     def _collect(self):
         while self.pending and self.pending[0][1].query():
-            start, end, host_start, tokens = self.pending.popleft()
+            start, end, tokens = self.pending.popleft()
             self.samples.append({"gpu_ms": start.elapsed_time(end), "tokens": tokens})
 
     def update_requests(self, output):

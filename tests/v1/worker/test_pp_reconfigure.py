@@ -3,7 +3,7 @@
 """Protect KV/request continuity and transaction recovery at the cheapest level.
 
 The worker owns layer/KV rebinding; its contract is tested on real GPUs by the
-acceptance script. These unit tests cover control ordering and failures before
+migration benchmark. These unit tests cover control ordering and failures before
 that expensive boundary, plus allocation-aware memory reporting.
 """
 
@@ -43,7 +43,7 @@ class Engine:
     async def is_paused(self):
         return self.paused
 
-    async def pause_generation(self, **kwargs):
+    async def pause_scheduler_async(self, **kwargs):
         assert kwargs == {"mode": "keep", "clear_cache": False}
         self.calls.append("pause")
         self.paused = True
@@ -752,7 +752,7 @@ def test_snapshot_batches_layers_and_acknowledges_after_all_are_applied(slots):
     def send(payload, metadata):
         live.channel.stream.synchronize()
         assert live.applied == 0
-        assert payload.nbytes <= 16 << 20
+        assert payload.nbytes <= 64 << 20
         assert metadata["last"] and metadata["watermark"] == 24
         assert metadata["version"] == 1
         for name, layer_payload in zip(metadata["layers"], payload, strict=True):
@@ -779,25 +779,31 @@ def test_snapshot_batches_layers_and_acknowledges_after_all_are_applied(slots):
         torch.testing.assert_close(target.block(name, 1), expected)
 
 
-def test_history_manifest_keeps_live_shared_prefixes_and_excludes_unused_blocks():
+def test_history_manifest_evicts_only_unreferenced_prefixes():
     from vllm.distributed.pp_reconfigure.resize import required_migration_blocks
-    from vllm.v1.core.kv_cache_utils import KVCacheBlock
+    from vllm.v1.core.block_pool import BlockPool
 
-    blocks = [KVCacheBlock(i) for i in range(7)]
-    blocks[0].is_null = True
-    blocks[1].ref_cnt = 2
-    blocks[2].ref_cnt = 1
-    blocks[3].set_block_hash(b"cached-prefix")
-    blocks[6].ref_cnt = 0
-    pool = SimpleNamespace(
-        blocks=blocks,
-        cached_block_hashes_by_block={4: {b"shared-alias"}},
-        _pp_disabled_blocks={6},
-    )
-    assert required_migration_blocks(pool) == [1, 2, 3, 4]
-    blocks[1].ref_cnt = 0
-    blocks[3].reset_hash()
-    assert required_migration_blocks(pool) == [2, 4]
+    pool = BlockPool(7, enable_caching=True, hash_block_size=16)
+    blocks = pool.get_new_blocks(4)
+    live, shared, idle, alias = blocks
+    shared.ref_cnt += 1
+    for block, key in zip(blocks, (b"live", b"shared", b"idle", b"alias")):
+        block.set_block_hash(key)
+        pool.cached_block_hash_to_block.insert(key, block)
+    pool.free_blocks([idle, alias])
+    alias_key = b"alias-extra"
+    pool.cached_block_hash_to_block.insert(alias_key, alias)
+    pool.cached_block_hashes_by_block[alias.block_id] = {alias_key}
+    free_before = pool.get_num_free_blocks()
+    generations = [b.allocation_generation for b in pool.blocks]
+    assert required_migration_blocks(pool) == [live.block_id, shared.block_id]
+    assert pool.cached_block_hash_to_block.get_one_block(b"live") is live
+    assert pool.cached_block_hash_to_block.get_one_block(b"shared") is shared
+    for key in (b"idle", b"alias", alias_key):
+        assert pool.cached_block_hash_to_block.get_one_block(key) is None
+    assert idle.block_hash is None and alias.block_hash is None
+    assert pool.get_num_free_blocks() == free_before
+    assert [b.allocation_generation for b in pool.blocks] == generations
 
 
 def test_cpu_weight_cache_bounds_resident_tensors_and_falls_back_to_disk():
@@ -962,7 +968,8 @@ def test_history_only_mode_defers_dirty_patches_until_final_sync():
     live.bitmap.mark([1])
     live.applied = 0
     historical_done = threading.Event()
-    snapshots, controls, errors = [], [], []
+    snapshots, errors = [], []
+    controls: list[dict] = []
 
     def snapshot(slots, watermark, full=False):
         snapshots.append((slots, watermark, full))
@@ -1074,11 +1081,11 @@ def test_inflight_patch_cannot_overwrite_reallocated_block():
         source.block(name, 1).fill_(7)
         incoming.block(name, 1).fill_(42)
     old_payload = torch.stack([copy_slots(source.handles[n], slots) for n in names])
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     for name in names:
         source.block(name, 1).fill_(9)
     new_payload = torch.stack([copy_slots(source.handles[n], slots) for n in names])
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     live = LiveLayerMigration.__new__(LiveLayerMigration)
     live.prepared = SimpleNamespace(
         new_kv=incoming.handles,
@@ -1323,14 +1330,14 @@ def test_utility_rpc_preserves_only_explicit_validation_errors(validation):
     def fail():
         raise error_type("rejected")
 
-    outputs = []
+    outputs: list[UtilityOutput] = []
     EngineCoreProc._invoke_utility_method(
         "molink_resize_kv", fail, UtilityOutput(7), outputs.append
     )
     decoded = msgspec.msgpack.decode(
         msgspec.msgpack.encode(outputs[0]), type=UtilityOutput
     )
-    future = Future()
+    future: Future[Any] = Future()
     _process_utility_output(decoded, {7: future})
     assert isinstance(future.exception(), ReconfigurationValidationError) == validation
 
@@ -1368,7 +1375,7 @@ def test_finalize_retains_old_weights_until_post_resume_cleanup(monkeypatch, def
     monkeypatch.setenv("VLLM_PP_RECONFIGURE_DEFER_CLEANUP", "1" if defer else "0")
 
     class OldLayer:
-        pass
+        weight_loader: "OldLayer"
 
     old = OldLayer()
     old.weight_loader = old  # Real parameters hold bound methods back to the layer.

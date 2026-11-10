@@ -7,20 +7,20 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlock
 
 
 def required_migration_blocks(pool):
-    """Retain live requests and reusable prefixes, including shared cached KV."""
-    disabled = getattr(pool, "_pp_disabled_blocks", set())
-    cached = pool.cached_block_hashes_by_block
-    return [
-        block.block_id
-        for block in pool.blocks
-        if block.block_id not in disabled
-        and not block.is_null
-        and (
-            block.ref_cnt > 0
-            or block.block_hash is not None
-            or cached.get(block.block_id)
-        )
-    ]
+    """Migrate referenced KV; evict idle prefixes before omitting their blocks."""
+    disabled: set[int] = getattr(pool, "_pp_disabled_blocks", set())
+    required = []
+    for block in pool.blocks:
+        if block.block_id in disabled or block.is_null:
+            continue
+        if block.ref_cnt > 0:
+            required.append(block.block_id)
+        elif block.block_hash is not None or pool.cached_block_hashes_by_block.get(
+            block.block_id
+        ):
+            # A later prefix hit must not expose KV omitted from the destination.
+            pool._maybe_evict_cached_block(block)
+    return required
 
 
 def plan_resize(pool, capacity):

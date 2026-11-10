@@ -155,9 +155,10 @@ class ReconfigurationController:
                         await asyncio.sleep(0.01)
                 pause_attempted = True
                 pause_started = time.perf_counter()
+                # Engine acknowledgement includes the keep-pause pipeline drain.
                 await phase(
                     "pause",
-                    lambda: self.engine.pause_generation(
+                    lambda: self.engine.engine_core.pause_scheduler_async(
                         mode="keep", clear_cache=False
                     ),
                 )
@@ -288,7 +289,7 @@ class ReconfigurationController:
                 if background_started and not paused and not finalized:
                     try:
                         pause_attempted = True
-                        await self.engine.pause_generation(
+                        await self.engine.engine_core.pause_scheduler_async(
                             mode="keep", clear_cache=False
                         )
                         paused = True

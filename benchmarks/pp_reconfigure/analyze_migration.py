@@ -70,7 +70,7 @@ def main():
     assert intersection_ms([(0, 3), (2, 5)], [(1, 4)]) == 3
     parser = argparse.ArgumentParser()
     parser.add_argument("comparison")
-    parser.add_argument("--target", type=int, default=18)
+    parser.add_argument("--target", type=int, default=6)
     parser.add_argument("--trace")
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
@@ -150,27 +150,6 @@ def main():
             "from the table.",
         ]
     (output / "report.md").write_text("\n".join(lines) + "\n")
-    import matplotlib.pyplot as plt
-
-    figure, axes = plt.subplots(1, 2, figsize=(9, 3.5))
-    modes = ["sync", "async"]
-    axes[0].bar(
-        modes,
-        [summary[mode]["pause_ms"]["mean"] for mode in modes],
-        color=["#94a3b8", "#0891b2"],
-    )
-    axes[0].set_ylabel("Inference pause (ms)")
-    axes[1].bar(
-        modes,
-        [100 * summary[mode]["overlap_fraction"]["mean"] for mode in modes],
-        color=["#94a3b8", "#0891b2"],
-    )
-    axes[1].set_ylabel("Forward-span overlap (%)")
-    axes[1].set_ylim(0, 100)
-    figure.suptitle("Pipeline reconfiguration: measured migration costs")
-    figure.tight_layout()
-    figure.savefig(output / "comparison.svg")
-    figure.savefig(output / "comparison.png", dpi=160)
     print(json.dumps(summary, indent=2))
 
 

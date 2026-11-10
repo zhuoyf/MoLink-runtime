@@ -51,10 +51,12 @@ two for a two-layer migration.
 1. Validate the partition, checkpoint and common intermediate KV capacity.
 2. Prepare incoming weights and detached KV allocations. Keep existing handles
    for retained layers and preserve logical block IDs during shrink/expand.
-3. Transfer history for active blocks and reusable shared prefix-cache blocks.
-   Unused, disabled and null blocks are excluded from the common manifest.
+3. Transfer history for referenced blocks, including shared active prefixes.
+   Evict idle cached prefixes before omitting their blocks from the manifest.
+   Disabled and null blocks are excluded.
 4. Track writes and block copies in a dirty bitmap. Gather all moving layers
-   into immutable payloads bounded by 16 MiB, then transfer them in the background.
+   into immutable payloads bounded by 64 MiB, then transfer them in the background.
+   Admission reserves 128 MiB for gather and payload buffers.
 5. Pause and drain inference after history finishes and the original token-lag
    convergence condition is met. Apply the final dirty set and synchronize both
    workers before committing the new partition.
@@ -124,10 +126,10 @@ kernel overlap are separate measurements; event-window estimates and Commit
 time alone do not establish service pause or device overlap. KV verification
 and profiling add overhead and should be disabled in latency measurements.
 
-`analyze_migration.py`, `visualize_migration.py`, and `plot_timeline.py` read
-benchmark outputs to produce local summaries and plots. Their CLI help describes
-required inputs. Generated measurements belong in the ignored local output
-directories or outside the repository.
+`analyze_migration.py` summarizes migration costs and optional CUDA kernel
+overlap. See the [benchmark guide](../../benchmarks/pp_reconfigure/README.md)
+for workload parameters and analysis commands. Generated measurements belong
+under `benchmark_results/` or outside the repository.
 
 ## Tests
 

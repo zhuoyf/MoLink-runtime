@@ -6,9 +6,21 @@ import argparse
 import json
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
-from acceptance import read_json, request
+
+def request(base, path, data=None):
+    body = json.dumps(data).encode() if data is not None else None
+    req = urllib.request.Request(
+        base + path, data=body, headers={"Content-Type": "application/json"}
+    )
+    return urllib.request.urlopen(req, timeout=180)
+
+
+def read_json(base, path, data=None):
+    with request(base, path, data) as response:
+        return json.load(response)
 
 
 def generate(base, payload, ready=None, outputs=None, times=None):
@@ -125,22 +137,38 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:26020")
     parser.add_argument("--model", default="pp-reconfigure-test")
-    parser.add_argument("--iterations", type=int, default=1)
+    parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--boundaries", type=int, nargs=2, default=[6, 8])
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=["sync", "async", "async_no_patching"],
+        default=["sync", "async"],
+    )
+    parser.add_argument("--input-tokens", type=int, default=128)
+    parser.add_argument("--output-tokens", type=int, default=192)
+    parser.add_argument("--concurrency", type=int, default=3)
+    parser.add_argument("--resize-kv", action="store_true")
     parser.add_argument("--verify-kv", action="store_true")
     parser.add_argument(
         "--output",
         default="benchmark_results/pp_reconfigure/comparison.json",
     )
     args = parser.parse_args()
+    if (
+        min(args.iterations, args.input_tokens, args.output_tokens, args.concurrency)
+        < 1
+    ):
+        parser.error("iterations, token counts and concurrency must be positive")
+    if args.output_tokens < 4:
+        parser.error("output-tokens must be at least 4 to trigger migration")
     payload = {
         "model": args.model,
         "prompt": [
-            "The capital of France is " * 8,
-            "Explain the water cycle. " * 8,
-            "A story about mountains. " * 8,
+            [1] + [42 + index] * (args.input_tokens - 1)
+            for index in range(args.concurrency)
         ],
-        "max_tokens": 192,
+        "max_tokens": args.output_tokens,
         "temperature": 0,
         "seed": 42,
         "ignore_eos": True,
@@ -153,7 +181,7 @@ def main():
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     for iteration in range(args.iterations):
-        for mode in ("sync", "async"):
+        for mode in args.modes:
             for boundary in args.boundaries:
                 result = trial(
                     args.url,
@@ -161,7 +189,8 @@ def main():
                     boundary,
                     mode,
                     expected,
-                    resize=iteration == 0
+                    resize=args.resize_kv
+                    and iteration == 0
                     and mode == "async"
                     and boundary == args.boundaries[0],
                     verify_kv=args.verify_kv,
