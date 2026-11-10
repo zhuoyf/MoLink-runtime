@@ -248,6 +248,7 @@ class UtilityOutput(
     # Non-None implies the call failed, result should be None.
     failure_message: str | None = None
     result: UtilityResult | None = None
+    failure_category: str | None = None
 
 
 class EngineCoreOutputs(

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
+import math
 import os
 import queue
 import signal
@@ -253,6 +254,21 @@ class EngineCore:
         self.aborts_queue = queue.Queue[list[str]]()
 
         self._idle_state_callbacks: list[Callable] = []
+        self._molink_resource_interval = 0.0
+        self._molink_resource_next = 0.0
+        if (
+            os.environ.get(
+                "HETVLLM_RESOURCE_MONITOR",
+                "1" if envs.VLLM_PP_RECONFIGURE_ENABLED else "0",
+            )
+            == "1"
+        ):
+            interval = float(os.environ.get("HETVLLM_RESOURCE_MONITOR_INTERVAL", "1"))
+            if not math.isfinite(interval) or interval <= 0:
+                raise ValueError(
+                    "resource monitor interval must be finite and positive"
+                )
+            self._molink_resource_interval = interval
 
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
@@ -994,6 +1010,141 @@ class EngineCore:
     def set_weight_version(self, weight_version: str) -> None:
         self._weight_version = weight_version
 
+    def molink_state(self, include_workers: bool = False) -> dict:
+        from vllm.v1.core.sched.scheduler import Scheduler
+
+        scheduler = cast(Scheduler, self.scheduler)
+        manager = scheduler.kv_cache_manager
+        pool = manager.block_pool
+        state: dict[str, Any] = {
+            "paused": self.is_scheduler_paused(),
+            "batch_queue_depth": len(self.batch_queue or ()),
+            "kv_cache_usage": manager.usage,
+            "num_blocks": pool.num_gpu_blocks,
+            "used_blocks": pool.num_gpu_blocks - pool.get_num_free_blocks(),
+            "requests": {
+                request_id: {
+                    "num_computed_tokens": request.num_computed_tokens,
+                    "num_preemptions": request.num_preemptions,
+                    "output_token_ids": list(request.output_token_ids),
+                    "block_ids": manager.get_block_ids(request_id),
+                }
+                for request_id, request in scheduler.requests.items()
+            },
+        }
+        if include_workers:
+            state["workers"] = self.collective_rpc("molink_monitor")
+            for worker in state["workers"]:
+                from vllm.distributed.pp_reconfigure.monitor import memory_metrics
+
+                worker.update(
+                    memory_metrics(
+                        worker["torch_allocated_bytes"],
+                        worker["torch_reserved_bytes"],
+                        worker["kv_capacity_bytes"],
+                        worker["kv_capacity_bytes"]
+                        * max(0, state["used_blocks"] - 1)
+                        // state["num_blocks"],
+                        worker["total_memory_bytes"],
+                    )
+                )
+        return state
+
+    def molink_resource_state(self) -> dict:
+        from vllm.v1.core.sched.scheduler import Scheduler
+
+        reports: list[dict | None] = self.collective_rpc("molink_resource_state")
+        master = next((r for r in reports if r is not None), None)
+        if master is None:
+            raise ValueError("resource monitor has not started")
+        master["scheduler_kv_cache_usage"] = cast(
+            Scheduler, self.scheduler
+        ).kv_cache_manager.usage
+        master["scheduler_paused"] = self.is_scheduler_paused()
+        return master
+
+    def _molink_maybe_publish_resources(self):
+        interval = getattr(self, "_molink_resource_interval", 0.0)
+        if interval and time.monotonic() >= self._molink_resource_next:
+            # Keep NCCL collectives in the common worker RPC order.
+            self.collective_rpc("molink_publish_resources")
+            self._molink_resource_next = time.monotonic() + interval
+
+    def molink_migrate(self, action, boundary=None, log_dir=None):
+        if action not in (
+            "describe",
+            "prepare_live",
+            "start_live",
+            "start_history",
+            "progress_live",
+            "prepared_live",
+            "start_cleanup",
+            "cleanup_progress",
+        ) and (self.scheduler.pause_state != PauseState.PAUSED_ALL or self.batch_queue):
+            raise ValueError("migration requires a completed keep pause")
+        if (
+            action in ("start_live", "start_history", "load_and_transfer")
+            and envs.VLLM_PP_RECONFIGURE_ONLINE
+        ):
+            from vllm.distributed.pp_reconfigure.resize import required_migration_blocks
+            from vllm.v1.core.sched.scheduler import Scheduler
+
+            pool = cast(Scheduler, self.scheduler).kv_cache_manager.block_pool
+            boundary = {
+                "block_ids": required_migration_blocks(pool),
+                "generations": [b.allocation_generation for b in pool.blocks],
+            }
+        results: list[dict[str, Any]] = self.collective_rpc(
+            "molink_migrate", args=(action, boundary, log_dir)
+        )
+        if action in ("commit", "rollback") and all(r["ok"] for r in results):
+            partitions = {r["partition"] for r in results}
+            if len(partitions) != 1:
+                raise ValueError("workers disagree on pipeline partition")
+            partition = partitions.pop()
+            os.environ["VLLM_PP_LAYER_PARTITION"] = partition
+            envs.VLLM_PP_LAYER_PARTITION = partition
+        return results
+
+    def molink_resize_kv(self, capacity):
+        from vllm.distributed.pp_reconfigure.control import validate_workers
+        from vllm.distributed.pp_reconfigure.resize import (
+            commit_pool_resize,
+            plan_resize,
+        )
+        from vllm.v1.core.sched.scheduler import Scheduler
+
+        if not envs.VLLM_PP_RECONFIGURE_ONLINE:
+            raise ValueError(
+                "KV resizing requires VLLM_PP_RECONFIGURE_ONLINE=1 at startup"
+            )
+        scheduler = cast(Scheduler, self.scheduler)
+        manager = scheduler.kv_cache_manager
+        pool = manager.block_pool
+        plan = plan_resize(pool, capacity)
+        try:
+            results: list[dict[str, Any]] = self.collective_rpc(
+                "molink_migrate", args=("prepare_resize_live", plan, None)
+            )
+            validate_workers(results)
+        except Exception:
+            cleanup: list[dict[str, Any]] = self.collective_rpc(
+                "molink_migrate", args=("rollback_resize_live", None, None)
+            )
+            validate_workers(cleanup)
+            raise
+        commit_pool_resize(pool, plan)
+        results = self.collective_rpc(
+            "molink_migrate", args=("commit_resize_live", None, None)
+        )
+        if any(not worker["ok"] for worker in results):
+            scheduler.set_pause_state(PauseState.PAUSED_ALL)
+        validate_workers(results)
+        manager.kv_cache_config.num_blocks = capacity
+        manager.watermark_blocks = int(scheduler.scheduler_config.watermark * capacity)
+        scheduler.cache_config.num_gpu_blocks = capacity
+        return {"plan": plan, "workers": results}
+
     def get_weight_version(self) -> str:
         """Return the latest committed weight version."""
         return self._weight_version
@@ -1424,6 +1575,7 @@ class EngineCoreProc(EngineCore):
     def run_busy_loop(self):
         """Core busy loop of the EngineCore."""
         while self._handle_shutdown():
+            self._molink_maybe_publish_resources()
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
             # Publish request counts before and after GPU step to ensure freshness.
@@ -1452,6 +1604,7 @@ class EngineCoreProc(EngineCore):
 
         waited = False
         while not self.has_work() and self.is_running():
+            self._molink_maybe_publish_resources()
             # Notify callbacks waiting for engine to become idle.
             self._notify_idle_state_callbacks()
             if self.input_queue.empty():
@@ -1463,7 +1616,15 @@ class EngineCoreProc(EngineCore):
                     waited = True
             block = self.process_input_queue_block
             try:
-                req = self.input_queue.get(block=block)
+                interval = getattr(self, "_molink_resource_interval", 0.0)
+                req = self.input_queue.get(
+                    block=block,
+                    timeout=(
+                        max(0.0, self._molink_resource_next - time.monotonic())
+                        if block and interval
+                        else None
+                    ),
+                )
                 self._handle_client_request(*req)
             except queue.Empty:
                 break
@@ -1629,6 +1790,12 @@ class EngineCoreProc(EngineCore):
         except Exception as e:
             logger.exception("Invocation of %s method failed", name)
             output.failure_message = f"Call to {name} method failed: {str(e)}"
+            from vllm.distributed.pp_reconfigure.errors import (
+                ReconfigurationValidationError,
+            )
+
+            if isinstance(e, ReconfigurationValidationError):
+                output.failure_category = "validation"
         enqueue_output(output)
 
     @staticmethod

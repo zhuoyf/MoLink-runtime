@@ -224,6 +224,7 @@ def kernel_unified_attention(
     rswa_prefix_lens_ptr,
     R_SWA_WINDOW: tl.constexpr,  # int
     USE_R_SWA: tl.constexpr,  # bool
+    BLOCK_TABLE_IS_ADDRESS: tl.constexpr,
     stride_k_cache_0: tl.int64,  # int
     stride_k_cache_1: tl.int64,  # int
     stride_k_cache_2: tl.int64,  # int
@@ -465,14 +466,21 @@ def kernel_unified_attention(
                 HEAD_SIZE_PADDED,
             )
         else:
+            block_offset = physical_block_idx * stride_k_cache_0
+            v_block_offset = physical_block_idx * stride_v_cache_0
+            if BLOCK_TABLE_IS_ADDRESS:
+                block_offset = (physical_block_idx - key_cache_ptr.to(tl.int64)) // (
+                    key_cache_ptr.dtype.element_ty.primitive_bitwidth // 8
+                )
+                v_block_offset = block_offset
             v_offset = (
-                physical_block_idx[:, None] * stride_v_cache_0
+                v_block_offset[:, None]
                 + kv_head_idx * stride_v_cache_2
                 + offs_d[None, :] * stride_v_cache_3
                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
             k_offset = (
-                physical_block_idx[None, :] * stride_k_cache_0
+                block_offset[None, :]
                 + kv_head_idx * stride_k_cache_2
                 + offs_d[:, None] * stride_k_cache_3
                 + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
@@ -847,7 +855,10 @@ def unified_attention(
     # Gemma4: clamp mm_prefix bidirectional ranges by the sliding window.
     # Default False keeps the original behavior for every other model.
     mm_prefix_clamp_sliding_window: bool = False,
+    block_table_is_address: bool = False,
 ):
+    if block_table_is_address:
+        assert not use_td and kv_quant_mode == KVQuantMode.NONE
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
     use_causal = bool(causal) if not use_per_seq_causal else True
@@ -1135,6 +1146,7 @@ def unified_attention(
         rswa_prefix_lens_ptr=rswa_prefix_lens if use_rswa else seqused_k,
         R_SWA_WINDOW=rswa_window or 0,
         USE_R_SWA=use_rswa,
+        BLOCK_TABLE_IS_ADDRESS=block_table_is_address,
         stride_k_cache_0=k.stride(0),
         stride_k_cache_1=k.stride(1),
         stride_k_cache_2=k.stride(2),

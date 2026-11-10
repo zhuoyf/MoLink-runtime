@@ -789,7 +789,16 @@ def _process_utility_output(
     failure_message = output.failure_message
     try:
         if failure_message is not None:
-            future.set_exception(Exception(failure_message))
+            from vllm.distributed.pp_reconfigure.errors import (
+                ReconfigurationValidationError,
+            )
+
+            error_type = (
+                ReconfigurationValidationError
+                if output.failure_category == "validation"
+                else Exception
+            )
+            future.set_exception(error_type(failure_message))
         else:
             assert output.result is not None
             future.set_result(output.result.result)
