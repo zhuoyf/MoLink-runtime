@@ -2,6 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import hashlib
+import json
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
@@ -18,6 +23,8 @@ class ReconfigureRequest(BaseModel):
     boundary: StrictInt
     mode: Literal["sync", "async", "async_no_patching"] = "sync"
     verify_kv: bool = False
+    expected_version: StrictInt | None = None
+    expected_boundary: StrictInt | None = None
 
 
 class ResizeRequest(BaseModel):
@@ -35,14 +42,23 @@ def controller(request):
 
 @router.get("/monitor")
 async def monitor(request: Request):
-    return await controller(request).state(True)
+    control = controller(request)
+    result = await control.state(True)
+    result["configuration_version"] = control.version
+    return result
 
 
 @router.post("/reconfigure")
 async def reconfigure(body: ReconfigureRequest, request: Request):
     try:
         return await asyncio.shield(
-            controller(request).reconfigure(body.boundary, body.mode, body.verify_kv)
+            controller(request).reconfigure(
+                body.boundary,
+                body.mode,
+                body.verify_kv,
+                expected_version=body.expected_version,
+                expected_boundary=body.expected_boundary,
+            )
         )
     except ReconfigurationValidationError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -53,9 +69,11 @@ async def reconfigure(body: ReconfigureRequest, request: Request):
 @router.get("/resource_status")
 async def resource_status(request: Request):
     try:
-        return await request.app.state.engine_client.engine_core.call_utility_async(
+        result = await request.app.state.engine_client.engine_core.call_utility_async(
             "molink_resource_state"
         )
+        result["configuration_version"] = controller(request).version
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -68,6 +86,7 @@ async def resize_kv(body: ResizeRequest, request: Request):
             status_code=409, detail="a reconfiguration is already running"
         )
     async with control.lock:
+        control.version += 1
         try:
             return await control.engine.engine_core.call_utility_async(
                 "molink_resize_kv", body.num_blocks
@@ -79,3 +98,86 @@ async def resize_kv(body: ResizeRequest, request: Request):
 def attach_router(app: FastAPI):
     if envs.VLLM_PP_RECONFIGURE_ENABLED:
         app.include_router(router)
+        if profile := os.environ.get("VLLM_PP_ADAPTIVE_PROFILE"):
+            from vllm.distributed.pp_reconfigure.adaptive.optimizer import (
+                OptimizerConfig,
+            )
+            from vllm.distributed.pp_reconfigure.adaptive.runtime import (
+                AdaptiveScheduler,
+            )
+
+            async def start_adaptive():
+                control = ReconfigurationController(
+                    app.state.engine_client, envs.VLLM_PP_RECONFIGURE_LOG_DIR
+                )
+                app.state.molink_controller = control
+                scheduler = AdaptiveScheduler(
+                    control,
+                    profile,
+                    os.environ.get(
+                        "VLLM_PP_ADAPTIVE_LOG_DIR", "benchmark_results/adaptive"
+                    ),
+                    OptimizerConfig(
+                        **{
+                            "stack_size": envs.VLLM_PP_RECONFIGURE_STACK_SIZE,
+                            **json.loads(
+                                os.environ.get("VLLM_PP_ADAPTIVE_CONFIG", "{}")
+                            ),
+                        }
+                    ),
+                    interval=float(os.environ.get("VLLM_PP_ADAPTIVE_INTERVAL", "5")),
+                )
+                conditions = scheduler.model.conditions
+                if (
+                    conditions.get("stack_size") != envs.VLLM_PP_RECONFIGURE_STACK_SIZE
+                    or scheduler.optimizer.config.stack_size
+                    != envs.VLLM_PP_RECONFIGURE_STACK_SIZE
+                ):
+                    raise ValueError("adaptive profile layer stacking does not match")
+                config_file = (
+                    Path(app.state.vllm_config.model_config.model) / "config.json"
+                )
+                if (
+                    conditions.get("config_sha256")
+                    != hashlib.sha256(config_file.read_bytes()).hexdigest()
+                ):
+                    raise ValueError(
+                        "adaptive profile model configuration does not match"
+                    )
+                if conditions.get("dtype") != str(
+                    app.state.vllm_config.model_config.dtype
+                ).removeprefix("torch."):
+                    raise ValueError("adaptive profile dtype does not match")
+                if "VLLM_PP_ADAPTIVE_ALPHA" in os.environ:
+                    from vllm.distributed.pp_reconfigure.adaptive.model import (
+                        PerformanceModel,
+                    )
+
+                    scheduler.model.alpha = PerformanceModel(
+                        float(os.environ["VLLM_PP_ADAPTIVE_ALPHA"])
+                    ).alpha
+                app.state.molink_adaptive = scheduler
+                scheduler.start()
+
+            async def stop_adaptive():
+                if scheduler := getattr(app.state, "molink_adaptive", None):
+                    await scheduler.stop()
+
+            previous_lifespan = app.router.lifespan_context
+
+            @asynccontextmanager
+            async def adaptive_lifespan(application):
+                async with previous_lifespan(application):
+                    await start_adaptive()
+                    try:
+                        yield
+                    finally:
+                        await stop_adaptive()
+
+            app.router.lifespan_context = adaptive_lifespan
+
+
+@router.get("/adaptive/status")
+async def adaptive_status(request: Request):
+    scheduler = getattr(request.app.state, "molink_adaptive", None)
+    return scheduler.status() if scheduler else {"running": False}

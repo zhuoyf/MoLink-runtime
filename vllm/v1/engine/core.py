@@ -1061,6 +1061,8 @@ class EngineCore:
             Scheduler, self.scheduler
         ).kv_cache_manager.usage
         master["scheduler_paused"] = self.is_scheduler_paused()
+        master["waiting_requests"] = len(cast(Scheduler, self.scheduler).waiting)
+        master["running_requests"] = len(cast(Scheduler, self.scheduler).running)
         return master
 
     def _molink_maybe_publish_resources(self):

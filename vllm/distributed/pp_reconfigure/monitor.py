@@ -37,12 +37,13 @@ class StageMonitor:
     """Nonblocking CUDA event timings; NVML counters are read only on polling."""
 
     def __init__(self):
-        self.pending: deque[tuple[torch.cuda.Event, torch.cuda.Event, int]] = deque()
+        self.pending: deque[tuple] = deque()
         self.samples: deque[dict[str, float | int]] = deque(maxlen=256)
         self.lock = threading.Lock()
         self.request_blocks: dict[str, set[int]] = {}
         self.kv_state_time = time.time()
         self.steps = 0
+        self.preemptions = 0
         self.dropped = 0
 
     def begin(self):
@@ -56,12 +57,14 @@ class StageMonitor:
         start.record()
         return start, end
 
-    def end(self, events, tokens):
+    def end(self, events, tokens, workload=None):
         if events is not None:
             events[1].record()
         with self.lock:
             if events is not None:
-                self.pending.append((*events, tokens))
+                self.pending.append(
+                    (*events, tokens, workload or {}, self.steps, time.time())
+                )
             self.steps += 1
 
     def collect(self):
@@ -70,12 +73,21 @@ class StageMonitor:
 
     def _collect(self):
         while self.pending and self.pending[0][1].query():
-            start, end, tokens = self.pending.popleft()
-            self.samples.append({"gpu_ms": start.elapsed_time(end), "tokens": tokens})
+            start, end, tokens, workload, sequence, timestamp = self.pending.popleft()
+            self.samples.append(
+                {
+                    "gpu_ms": start.elapsed_time(end),
+                    "tokens": tokens,
+                    "sequence": sequence,
+                    "timestamp": timestamp,
+                    **workload,
+                }
+            )
 
     def update_requests(self, output):
         """Mirror scheduler block assignments on CPU, including shared prefixes."""
         with self.lock:
+            self.preemptions += len(output.preempted_req_ids or ())
             for req_id in output.finished_req_ids | (output.preempted_req_ids or set()):
                 self.request_blocks.pop(req_id, None)
             for request in output.scheduled_new_reqs:
@@ -110,6 +122,20 @@ class StageMonitor:
         decoder = getattr(runner.get_model(), "model", None)
         properties = torch.cuda.get_device_properties(worker.device)
         total = properties.total_memory
+        device_free, _ = torch.accelerator.get_memory_info(worker.device)
+        allocated = torch.accelerator.memory_allocated(worker.device)
+        reserved = torch.accelerator.memory_reserved(worker.device)
+        workload_samples = {}
+        for sample in samples:
+            if "phase" in sample:
+                key = (
+                    sample["phase"],
+                    sample["batch"],
+                    max(1, int(sample["context"])).bit_length(),
+                    max(1, int(sample["tokens"])).bit_length(),
+                    sample["layers"],
+                )
+                workload_samples[key] = sample
         result = {
             "host": socket.gethostname(),
             "pid": os.getpid(),
@@ -125,7 +151,31 @@ class StageMonitor:
                 sum(s["gpu_ms"] for s in samples) / len(samples) if samples else None
             ),
             "stage_last": samples[-1] if samples else None,
+            "compute_timing_scope": "forward_after_pp_receive"
+            if worker.use_v2_model_runner
+            else "runner",
+            "workload_samples": sorted(
+                workload_samples.values(), key=lambda s: s["sequence"]
+            )[-24:],
+            "preemptions": self.preemptions,
+            "memory_budget_bytes": min(
+                int(total * worker.vllm_config.cache_config.gpu_memory_utilization),
+                device_free + reserved,
+            ),
+            "weight_bytes_per_layer": (
+                sum(
+                    t.numel() * t.element_size()
+                    for t in decoder.layers[decoder.start_layer].state_dict().values()
+                )
+                if decoder is not None
+                else 0
+            ),
             "num_blocks": config.num_blocks,
+            "block_size": config.kv_cache_groups[0].kv_cache_spec.block_size,
+            "block_cap": worker.vllm_config.cache_config.num_gpu_blocks_override,
+            "kv_payload_bytes_per_layer_block": config.kv_cache_groups[
+                0
+            ].kv_cache_spec.page_size_bytes,
             "layer_range": [
                 getattr(decoder, "start_layer", None),
                 getattr(decoder, "end_layer", None),
@@ -137,8 +187,8 @@ class StageMonitor:
             "kv_state_time": kv_state_time,
             "total_memory_bytes": total,
             **memory_metrics(
-                torch.accelerator.memory_allocated(worker.device),
-                torch.accelerator.memory_reserved(worker.device),
+                allocated,
+                reserved,
                 capacity,
                 capacity * used_blocks // config.num_blocks,
                 total,

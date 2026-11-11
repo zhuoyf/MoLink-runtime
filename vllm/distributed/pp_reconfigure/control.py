@@ -41,13 +41,22 @@ class ReconfigurationController:
         self.engine = engine
         self.log_root = Path(log_root)
         self.lock = asyncio.Lock()
+        self.version = 0
 
     async def state(self, include_workers=False):
         return await self.engine.engine_core.call_utility_async(
             "molink_state", include_workers
         )
 
-    async def reconfigure(self, boundary, mode="sync", verify_kv=False):
+    async def reconfigure(
+        self,
+        boundary,
+        mode="sync",
+        verify_kv=False,
+        *,
+        expected_version=None,
+        expected_boundary=None,
+    ):
         if mode not in ("sync", "async", "async_no_patching"):
             raise ReconfigurationValidationError(
                 "migration mode must be sync, async, or async_no_patching"
@@ -55,6 +64,16 @@ class ReconfigurationController:
         if self.lock.locked():
             raise ReconfigurationValidationError("a reconfiguration is already running")
         async with self.lock:
+            if expected_version is not None and expected_version != self.version:
+                raise ReconfigurationValidationError(
+                    "stale scheduler configuration version"
+                )
+            if expected_boundary is not None:
+                current = await self.state(True)
+                worker = next(w for w in current["workers"] if w["stage"] == 0)
+                if worker["layer_range"][1] != expected_boundary:
+                    raise ReconfigurationValidationError("stale scheduler partition")
+            self.version += 1
             run_id = uuid.uuid4().hex
             directory = str(self.log_root / run_id)
             timings = {}

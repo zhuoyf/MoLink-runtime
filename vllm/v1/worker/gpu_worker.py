@@ -11,7 +11,7 @@ from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from datetime import timedelta
 from types import NoneType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import regex as re
@@ -178,6 +178,7 @@ def _pp_trace(rank: int, rec: dict) -> None:
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
@@ -1410,6 +1411,10 @@ class Worker(WorkerBase):
                 self._molink_monitor = StageMonitor()
             _monitor = self._molink_monitor
             _monitor_events = _monitor.begin()
+            if self.use_v2_model_runner:
+                cast(
+                    "GPUModelRunnerV2", self.model_runner
+                )._molink_compute_events = _monitor_events
         with self.annotate_profile(scheduler_output):
             if live := getattr(self, "_pp_reconfigure", None):
                 live.begin_compute()
@@ -1419,8 +1424,35 @@ class Worker(WorkerBase):
             if live is not None:
                 live.end_compute()
             if _monitor is not None:
+                if self.use_v2_model_runner:
+                    cast(
+                        "GPUModelRunnerV2", self.model_runner
+                    )._molink_compute_events = None
                 _monitor.end(
-                    _monitor_events, scheduler_output.total_num_scheduled_tokens
+                    _monitor_events,
+                    scheduler_output.total_num_scheduled_tokens,
+                    {
+                        "batch": len(scheduler_output.num_scheduled_tokens),
+                        "context": max(
+                            [1]
+                            + list(
+                                scheduler_output.scheduled_cached_reqs.num_computed_tokens
+                            )
+                            + [
+                                r.num_computed_tokens + len(r.prompt_token_ids or [])
+                                for r in scheduler_output.scheduled_new_reqs
+                            ]
+                        ),
+                        "phase": "prefill"
+                        if scheduler_output.scheduled_new_reqs
+                        or any(
+                            n > 1
+                            for n in scheduler_output.num_scheduled_tokens.values()
+                        )
+                        else "decode",
+                        "layers": self.model_runner.get_model().model.end_layer
+                        - self.model_runner.get_model().model.start_layer,
+                    },
                 )
             if (
                 self.use_v2_model_runner

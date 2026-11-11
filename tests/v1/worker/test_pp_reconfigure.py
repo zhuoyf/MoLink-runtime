@@ -1502,13 +1502,14 @@ def test_http_conflicts_do_not_hide_internal_errors(kind, status, endpoint, payl
     from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
     from vllm.entrypoints.serve.dev.molink import api_router
 
-    async def fail(*args):
+    async def fail(*args, **kwargs):
         if kind == "validation":
             raise ReconfigurationValidationError("invalid request")
         raise ValueError("internal bug")
 
     control = SimpleNamespace(
         lock=asyncio.Lock(),
+        version=0,
         reconfigure=fail,
         engine=SimpleNamespace(engine_core=SimpleNamespace(call_utility_async=fail)),
     )
@@ -1519,3 +1520,30 @@ def test_http_conflicts_do_not_hide_internal_errors(kind, status, endpoint, payl
         TestClient(app, raise_server_exceptions=False) as client,
     ):
         assert client.post(endpoint, json=payload).status_code == status
+
+
+def test_resource_monitor_defers_incomplete_cuda_reports_without_waiting(tmp_path):
+    from unittest.mock import Mock
+
+    from vllm.distributed.pp_reconfigure.resource_monitor import (
+        ResourceMonitor,
+        pack_report,
+    )
+
+    monitor = ResourceMonitor(0, lambda: {}, log_dir=str(tmp_path))
+    local = {"stage": 0, "pid": 1, "sequence": 1}
+    peer = {"stage": 1, "pid": 2, "sequence": 1}
+    host = torch.stack([pack_report(local), pack_report(peer)])
+    start = Mock()
+    start.elapsed_time.return_value = 2
+    end = Mock()
+    end.query.return_value = False
+    monitor.pending.append((start, end, host, local, "pp:test"))
+    monitor.collect_reports()
+    assert not monitor.reports
+    start.elapsed_time.assert_not_called()
+    end.synchronize.assert_not_called()
+    end.query.return_value = True
+    monitor.collect_reports()
+    assert monitor.snapshot()["reports_received"] == {0: 1, 1: 1}
+    assert monitor.publish_seconds == 0.002

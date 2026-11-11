@@ -8,6 +8,7 @@ import os
 import socket
 import threading
 import time
+from collections import deque
 from typing import Any
 
 import torch
@@ -65,6 +66,7 @@ class ResourceMonitor:
         self.latest: dict[str, Any] = {}
         self.reports: dict[int, dict[str, Any]] = {}
         self.counts = {0: 0, 1: 0}
+        self.pending: deque[tuple] = deque()
         self.stop_event = threading.Event()
         self.thread = threading.Thread(
             target=self._run, name=f"MoLinkResourceMonitor-{stage}", daemon=True
@@ -90,6 +92,7 @@ class ResourceMonitor:
 
     def _run(self):
         while not self.stop_event.is_set():
+            self.collect_reports()
             self.sample_once()
             self.stop_event.wait(self.interval)
 
@@ -105,30 +108,58 @@ class ResourceMonitor:
                 "pid": os.getpid(),
                 "sequence": self.sequence,
             }
-        with torch.cuda.device(device):
-            frame = pack_report(report).to(device)
-            # GroupCoordinator routes this to its already initialized PyNCCL comm.
-            gathered = group.all_gather(frame, dim=0).reshape(2, FRAME_BYTES).cpu()
+        if device.type == "cpu":
+            gathered = group.all_gather(pack_report(report), dim=0).reshape(
+                2, FRAME_BYTES
+            )
+            self._receive(report, gathered, group.unique_name, 0.0)
+            return self.snapshot()
+        with torch.accelerator.device_index(device.index):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            frame = pack_report(report).to(device, non_blocking=True)
+            # Keep collective ordering on the existing PP stream and communicator.
+            gathered = group.all_gather(frame, dim=0).reshape(2, FRAME_BYTES)
+            host = torch.empty((2, FRAME_BYTES), dtype=torch.uint8, pin_memory=True)
+            host.copy_(gathered, non_blocking=True)
+            end.record()
+        with self.lock:
+            self.pending.append((start, end, host, report, group.unique_name))
+        return self.snapshot()
+
+    def collect_reports(self):
+        """Only consume completed D2H copies; never synchronize an inference stream."""
+        while True:
+            with self.lock:
+                if not self.pending or not self.pending[0][1].query():
+                    return
+                start, end, host, report, group_name = self.pending.popleft()
+            self._receive(report, host, group_name, start.elapsed_time(end) / 1000)
+
+    def _receive(self, report, gathered, group_name, elapsed):
+        self.publish_seconds = elapsed
         write_event(
             self.log_dir,
             f"stage-{self.stage}-monitor",
             event="published",
             transport="nccl",
             operation="all_gather",
-            group=group.unique_name,
+            group=group_name,
             **report,
         )
         if self.stage != 0:
-            return None
+            return
         for frame in gathered:
             incoming = unpack_report(frame)
             stage = incoming["stage"]
-            self.reports[stage] = {
-                "metrics": incoming,
-                "received_time": time.time(),
-                "received_monotonic": time.monotonic(),
-            }
-            self.counts[stage] += 1
+            with self.lock:
+                self.reports[stage] = {
+                    "metrics": incoming,
+                    "received_time": time.time(),
+                    "received_monotonic": time.monotonic(),
+                }
+                self.counts[stage] += 1
             if stage != 0:
                 write_event(
                     self.log_dir,
@@ -141,17 +172,19 @@ class ResourceMonitor:
                     sequence=incoming["sequence"],
                     transport="nccl",
                     operation="all_gather",
-                    group=group.unique_name,
+                    group=group_name,
                     metrics=incoming,
                 )
-        return self.snapshot()
 
     def snapshot(self):
         if self.stage != 0:
             return None
         now = time.monotonic()
         workers = []
-        for stage, report in sorted(self.reports.items()):
+        with self.lock:
+            reports = list(self.reports.items())
+            counts = dict(self.counts)
+        for stage, report in sorted(reports):
             age = max(0, now - report["received_monotonic"])
             workers.append(
                 {
@@ -169,9 +202,11 @@ class ResourceMonitor:
             "master_host": socket.gethostname(),
             "transport": "nccl",
             "interval_seconds": self.interval,
-            "reports_received": dict(self.counts),
+            "reports_received": counts,
             "workers": workers,
             "decision_mode": "manual",
+            "publish_seconds": getattr(self, "publish_seconds", None),
+            "publish_bytes": FRAME_BYTES * 2,
         }
 
     def stop(self):
