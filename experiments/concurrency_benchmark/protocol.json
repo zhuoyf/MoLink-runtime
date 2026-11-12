@@ -1,0 +1,18 @@
+{
+  "concurrencies": [2, 4, 8, 12, 16, 24, 32, 48, 64],
+  "strategies": ["full", "threshold", "static_4", "static_8", "static_12", "static_16", "static_20", "static_24", "static_28"],
+  "repeats": 3,
+  "window_seconds": 600,
+  "phase_seconds": 200,
+  "input_tokens": 32,
+  "output_tokens": 96,
+  "seed": 42,
+  "ttft_slo_ms": 5000,
+  "tpot_slo_ms": 100,
+  "max_num_seqs": 64,
+  "max_num_batched_tokens": 128,
+  "num_gpu_blocks_override": 128,
+  "best_static_selection": "maximum repeat mean whole-window throughput, one boundary per concurrency",
+  "goodput": "window tokens belonging to complete requests satisfying both SLO limits",
+  "failure_policy": "stop and preserve all evidence; never modify conditions to improve results"
+}

@@ -1,0 +1,12 @@
+{
+  "time": 1794494697.5551558,
+  "client_inflight": 64,
+  "running_requests": 17,
+  "waiting_requests": 47,
+  "kv_cache_usage": 1.0,
+  "num_blocks": 128,
+  "used_blocks": 128,
+  "boundary": 8,
+  "failure": "HTTP 409: KV shrink would release active request blocks",
+  "formal_started": false
+}

@@ -83,6 +83,7 @@ class AdaptiveScheduler:
                         "kv_payload_bytes_per_layer_block",
                         self.model.conditions.get("kv_payload_bytes_per_layer_block"),
                     ),
+                    kv_budget_bytes=w.get("kv_budget_bytes"),
                 )
             )
             for sample in w.get("workload_samples", []):

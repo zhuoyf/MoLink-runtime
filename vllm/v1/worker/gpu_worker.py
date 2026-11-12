@@ -1621,6 +1621,19 @@ class Worker(WorkerBase):
 
         return migration_rpc(self, action, boundary, log_dir)
 
+    def molink_simulate(self, configurations):
+        from vllm.distributed.pp_reconfigure.heterogeneity import HeterogeneitySimulator
+
+        if not self.use_v2_model_runner or not self.model_config.enforce_eager:
+            raise ValueError("simulation requires V2/eager")
+        simulator = HeterogeneitySimulator(
+            **configurations[get_pp_group().rank_in_group]
+        )
+        if previous := getattr(self.model_runner, "_molink_simulator", None):
+            simulator.counters.update(previous.counters)
+        cast("GPUModelRunnerV2", self.model_runner)._molink_simulator = simulator
+        return {"ok": True}
+
     def molink_monitor(self):
         from vllm.distributed.pp_reconfigure.monitor import StageMonitor
 

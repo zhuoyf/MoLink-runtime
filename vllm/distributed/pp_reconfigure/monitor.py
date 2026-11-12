@@ -194,6 +194,10 @@ class StageMonitor:
                 total,
             ),
         }
+        if simulator := getattr(runner, "_molink_simulator", None):
+            result["kv_budget_bytes"] = simulator.kv_budget_bytes
+            result["decode_ms_per_layer"] = simulator.decode_ms_per_layer
+            result["simulation_counters"] = dict(simulator.counters)
         try:
             nvml = import_pynvml()
             nvml.nvmlInit()

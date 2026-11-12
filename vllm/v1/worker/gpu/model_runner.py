@@ -36,6 +36,7 @@ from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
 )
+from vllm.distributed.pp_reconfigure.heterogeneity import HeterogeneitySimulator
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
@@ -294,6 +295,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         self.step_timing = StepTimingCollector()
+        self._molink_simulator: HeterogeneitySimulator | None = None
         self._molink_compute_events: (
             tuple[torch.cuda.Event, torch.cuda.Event] | None
         ) = None
@@ -1737,6 +1739,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if events := getattr(self, "_molink_compute_events", None):
             # Exclude PP receive waits and input preparation from compute cost.
             events[0].record()
+        if simulator := getattr(self, "_molink_simulator", None):
+            decoder = self.get_model().model
+            simulator.delay(scheduler_output, decoder.end_layer - decoder.start_layer)
         self.step_timing.forward_start()
 
         # Run model.

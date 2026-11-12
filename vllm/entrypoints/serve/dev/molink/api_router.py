@@ -95,6 +95,30 @@ async def resize_kv(body: ResizeRequest, request: Request):
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+class SimulationRequest(BaseModel):
+    stages: list[dict]
+    target_boundary: StrictInt | None = None
+
+
+@router.post("/heterogeneity")
+async def heterogeneity(body: SimulationRequest, request: Request):
+    if os.environ.get("MOLINK_HETEROGENEITY_SIMULATION") != "1":
+        raise HTTPException(
+            status_code=403, detail="experimental simulation is disabled"
+        )
+    control = controller(request)
+    async with control.lock:
+        try:
+            result = await control.engine.engine_core.call_utility_async(
+                "molink_simulate", body.stages, body.target_boundary
+            )
+            control.version += 1
+            result["configuration_version"] = control.version
+            return result
+        except (ValueError, ReconfigurationValidationError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 def attach_router(app: FastAPI):
     if envs.VLLM_PP_RECONFIGURE_ENABLED:
         app.include_router(router)

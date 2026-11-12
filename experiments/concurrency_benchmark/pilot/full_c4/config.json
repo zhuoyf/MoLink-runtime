@@ -1,0 +1,112 @@
+{
+  "phases": {
+    "A": [
+      {
+        "decode_ms_per_layer": 0,
+        "kv_budget_bytes": 2147483648
+      },
+      {
+        "decode_ms_per_layer": 0,
+        "kv_budget_bytes": 2147483648
+      }
+    ],
+    "B": [
+      {
+        "decode_ms_per_layer": 0,
+        "kv_budget_bytes": 2147483648
+      },
+      {
+        "decode_ms_per_layer": 5,
+        "kv_budget_bytes": 805306368
+      }
+    ],
+    "C": [
+      {
+        "decode_ms_per_layer": 5,
+        "kv_budget_bytes": 805306368
+      },
+      {
+        "decode_ms_per_layer": 0,
+        "kv_budget_bytes": 2147483648
+      }
+    ]
+  },
+  "phase_seconds": 40,
+  "initial_boundary": 16,
+  "repeats": 5,
+  "slo": {
+    "ttft_ms": 5000,
+    "tpot_ms": 100
+  },
+  "decision_interval": 5,
+  "optimizer": {
+    "stack_size": 4,
+    "horizon": 90,
+    "cooldown": 20,
+    "min_gain": 0.05
+  },
+  "arrivals": [
+    {
+      "offset": 0,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 12,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 24,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 36,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 48,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 60,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 72,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 84,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 96,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 108,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    }
+  ],
+  "oracle": "phase-aware, actual migration costs included",
+  "profile_sha256": "aa441ab486ed8cd2046948f6bd224a3b3f4d74027340ab0401c9d3187f96b9bc"
+}

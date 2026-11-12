@@ -97,6 +97,8 @@ class PartitionOptimizer:
                     (node.memory_budget - final_non_kv - cfg.memory_reserve) / per_block
                 ),
             )
+            if node.kv_budget_bytes is not None:
+                capacity = min(capacity, int(node.kv_budget_bytes / per_block))
             if node.block_cap is not None:
                 capacity = min(capacity, node.block_cap)
             if boundary == state.boundary:

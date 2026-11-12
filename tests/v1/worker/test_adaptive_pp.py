@@ -338,3 +338,29 @@ def test_decode_balances_the_pipeline_bottleneck_for_concurrent_requests():
     assert PartitionOptimizer().decide(state, model, 100)["target"] == 8
     state.phase = "prefill"
     assert PartitionOptimizer().decide(state, model, 100)["target"] == 4
+
+
+def test_heterogeneity_budget_and_delay(monkeypatch):
+    from types import SimpleNamespace
+
+    import vllm.distributed.pp_reconfigure.heterogeneity as module
+    from vllm.distributed.pp_reconfigure.heterogeneity import HeterogeneitySimulator
+
+    waits: list[float] = []
+    monkeypatch.setattr(module.time, "sleep", waits.append)
+    sim = HeterogeneitySimulator(5, 768 << 20)
+    assert sim.capacity(16, 524288, 128) == 96
+    output = SimpleNamespace(
+        scheduled_new_reqs=[],
+        num_scheduled_tokens={"r": 1},
+        total_num_scheduled_tokens=1,
+        scheduled_cached_reqs=SimpleNamespace(resumed_req_ids=[]),
+    )
+    sim.delay(output, 8)
+    assert waits == [0.04]
+    output.num_scheduled_tokens = {"r": 32}
+    sim.delay(output, 8)
+    assert waits == [0.04]
+    assert sim.counters["prefill_tokens"] == 32
+    with pytest.raises(ValueError):
+        HeterogeneitySimulator(float("nan"))

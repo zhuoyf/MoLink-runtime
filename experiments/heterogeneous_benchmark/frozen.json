@@ -1,0 +1,277 @@
+{
+  "phases": {
+    "A": [
+      {
+        "decode_ms_per_layer": 0,
+        "kv_budget_bytes": 2147483648
+      },
+      {
+        "decode_ms_per_layer": 0,
+        "kv_budget_bytes": 2147483648
+      }
+    ],
+    "B": [
+      {
+        "decode_ms_per_layer": 0,
+        "kv_budget_bytes": 2147483648
+      },
+      {
+        "decode_ms_per_layer": 5,
+        "kv_budget_bytes": 805306368
+      }
+    ],
+    "C": [
+      {
+        "decode_ms_per_layer": 5,
+        "kv_budget_bytes": 805306368
+      },
+      {
+        "decode_ms_per_layer": 0,
+        "kv_budget_bytes": 2147483648
+      }
+    ]
+  },
+  "phase_seconds": 120,
+  "initial_boundary": 16,
+  "repeats": 5,
+  "slo": {
+    "ttft_ms": 5000,
+    "tpot_ms": 100
+  },
+  "decision_interval": 5,
+  "optimizer": {
+    "stack_size": 4,
+    "horizon": 90,
+    "cooldown": 20,
+    "min_gain": 0.05
+  },
+  "arrivals": [
+    {
+      "offset": 0,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 12,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 24,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 36,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 48,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 60,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 72,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 84,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 96,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 108,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 120,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 132,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 144,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 156,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 168,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 180,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 192,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 204,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 216,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 228,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 240,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 252,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 264,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 276,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 288,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 300,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 312,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 324,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 336,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    },
+    {
+      "offset": 348,
+      "batch": 4,
+      "context": 32,
+      "output": 96
+    }
+  ],
+  "oracle": "phase-aware, actual migration costs included",
+  "profile_sha256": "aa441ab486ed8cd2046948f6bd224a3b3f4d74027340ab0401c9d3187f96b9bc",
+  "environment": {
+    "python": "3.12.16",
+    "torch": "2.13.0+cu129",
+    "cuda": "12.9",
+    "nccl": [
+      2,
+      29,
+      7
+    ]
+  },
+  "sources": {
+    "/workspace/molink-runtime/vllm/experiments/heterogeneous_benchmark/freeze.py": "384ee5f12e96b8df6633f976a1a5d814fe1cdd1c8521e5e4cadd61a462603ec1",
+    "/workspace/molink-runtime/vllm/experiments/heterogeneous_benchmark/report.py": "76fbbe1c5c255d43bbf8b0344b9ce101b6af4cfc0f822fbe8ad4126a50fb20f1",
+    "/workspace/molink-runtime/vllm/experiments/heterogeneous_benchmark/benchmark.py": "337e1c5ef22fad4f1d639a06a4a04b2ac3ac8b8c42be765efb4a21823665c3ee",
+    "/workspace/molink-runtime/vllm/experiments/heterogeneous_benchmark/04_report.sh": "e131eda640f7a84b0efa794ca2b72dcd3bbab6b5bd3a255446bdbfb77fc8b4ec",
+    "/workspace/molink-runtime/vllm/experiments/heterogeneous_benchmark/01_profile.sh": "a1f3e1db4d35bc0624ac9fb94572681c5c316309ebe21b5bd0203c8a7316794d",
+    "/workspace/molink-runtime/vllm/experiments/heterogeneous_benchmark/run_all.sh": "5bbf0350fac67f17bb9dbee3658753ca41691324304003eb1c6859a6b9e18f39",
+    "/workspace/molink-runtime/vllm/experiments/heterogeneous_benchmark/02_validate.sh": "553d624efe72be668552ae8694fe46f70b31cf54600002faab81e31a207c4aa9",
+    "/workspace/molink-runtime/vllm/experiments/heterogeneous_benchmark/03_comparison.sh": "1d30d766652874e252b0f60afc3954dc99d1e2c92f9a84b02ed89c011929f6ce",
+    "/workspace/molink-runtime/vllm/experiments/heterogeneous_benchmark/serve.sh": "86320b70170131c8c4eabfda3b4794e1254c21826e3c4f0b5aa2cec03bed59b9",
+    "/workspace/molink-runtime/vllm/experiments/heterogeneous_benchmark/status.sh": "2ba46b8f5c0a1bb6fa16db41cb64b35e037230ad92e91a372c6283e320fbef28",
+    "benchmark_results/adaptive-final-llama7b/profile.json": "aa441ab486ed8cd2046948f6bd224a3b3f4d74027340ab0401c9d3187f96b9bc",
+    "/workspace/molink-runtime/vllm/experiments/heterogeneous_benchmark/pilot/phase_best.json": "3a388d99e6d6d24db42b56b7867d0ae7a0164e72655aa9b9c9065661d3f078b5",
+    "vllm/distributed/pp_reconfigure/adaptive/__init__.py": "59b0e30c1fa1ee20369ac20e7de8b38ccf2816a8442f95e90f65a579ae178945",
+    "vllm/distributed/pp_reconfigure/adaptive/optimizer.py": "4b1fbfffe873a339b16a8283d765a8a2be8637a5d6dd5b0412b070fccceadb71",
+    "vllm/distributed/pp_reconfigure/adaptive/model.py": "3a5a6eb76646a23cbaf444415b92dea31f774269b5a28e755a748a71e0ea19f4",
+    "vllm/distributed/pp_reconfigure/adaptive/runtime.py": "bf7397064fc6394826a92e35ec5c4873993ffc8f04bb0776a4ca94aa5c18658a",
+    "vllm/distributed/pp_reconfigure/adaptive/security.py": "08cd08ae21cfcf8f8bd35b99f2a6245705632d3010c48ac0d8aade1d8d2ab0e4",
+    "vllm/distributed/pp_reconfigure/heterogeneity.py": "05c179b924c4640cd54bd37123df21a5a5fa9e3b03c423d716f6e82a2d2f7a58",
+    "vllm/distributed/pp_reconfigure/monitor.py": "248dc2ef8cda09f26bef17c76d84f98c8e6026a3d31d25156eaac4be2dcc515d",
+    "vllm/v1/worker/gpu_worker.py": "a8b109969c59fe64ffafdc54eb1362eee73f29987b439ae108f917c076f9467e",
+    "vllm/v1/worker/gpu/model_runner.py": "9293ef0a6f070bef8cd864b3ff41e492ce9500e483b8e704949547b7b94cff9d",
+    "vllm/v1/engine/core.py": "e4ffac84fbdf8cf0380ecb916ef43543a6084711a6726d3ac8faaa2735ed110d",
+    "vllm/entrypoints/serve/dev/molink/api_router.py": "df98e70e43ab329c71d210f4b08bb177056c7a7a0c76a75234c0e311b1e5f593"
+  },
+  "pilot_validation": {
+    "requests": 60,
+    "token_mismatches": 0,
+    "extra_prefill_tokens": 0,
+    "targets": [
+      20,
+      12,
+      8
+    ]
+  }
+}

@@ -191,6 +191,8 @@ class NodeState:
     block_cap: int | None = None
     kv_payload_bytes_per_layer_block: float | None = None
 
+    kv_budget_bytes: int | None = None
+
     @property
     def transfer_bytes_per_block(self):
         return (

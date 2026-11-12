@@ -1019,6 +1019,8 @@ class EngineCore:
         state: dict[str, Any] = {
             "paused": self.is_scheduler_paused(),
             "batch_queue_depth": len(self.batch_queue or ()),
+            "running_requests": len(scheduler.running),
+            "waiting_requests": len(scheduler.waiting),
             "kv_cache_usage": manager.usage,
             "num_blocks": pool.num_gpu_blocks,
             "used_blocks": pool.num_gpu_blocks - pool.get_num_free_blocks(),
@@ -1107,6 +1109,44 @@ class EngineCore:
             os.environ["VLLM_PP_LAYER_PARTITION"] = partition
             envs.VLLM_PP_LAYER_PARTITION = partition
         return results
+
+    def molink_simulate(self, configurations, target_boundary=None):
+        from vllm.distributed.pp_reconfigure.heterogeneity import HeterogeneitySimulator
+
+        if len(configurations) != 2:
+            raise ValueError("simulation requires exactly two stage configurations")
+        simulations = [HeterogeneitySimulator(**c) for c in configurations]
+        workers: list[dict[str, Any]] = self.collective_rpc("molink_monitor")
+        total = sum(w["layer_range"][1] - w["layer_range"][0] for w in workers)
+        if target_boundary is not None and (
+            not 0 < target_boundary < total
+            or target_boundary % envs.VLLM_PP_RECONFIGURE_STACK_SIZE
+        ):
+            raise ValueError("invalid simulation target boundary")
+        capacities = []
+        for w in workers:
+            stage = w["stage"]
+            layers = w["layer_range"][1] - w["layer_range"][0]
+            per_block = w["kv_capacity_bytes"] / layers / w["num_blocks"]
+            target = (
+                layers
+                if target_boundary is None
+                else (target_boundary if stage == 0 else total - target_boundary)
+            )
+            capacities.append(
+                simulations[stage].capacity(
+                    max(layers, target), per_block, w["block_cap"]
+                )
+            )
+        capacity = min(capacities)
+        resize = self.molink_resize_kv(capacity)
+        self.collective_rpc("molink_simulate", args=(configurations,))
+        return {
+            "capacity": capacity,
+            "stage_limits": capacities,
+            "resize": resize,
+            "workers": self.collective_rpc("molink_monitor"),
+        }
 
     def molink_resize_kv(self, capacity):
         from vllm.distributed.pp_reconfigure.control import validate_workers
