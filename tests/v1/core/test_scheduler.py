@@ -6313,3 +6313,56 @@ def test_encoder_input_skipped_when_connector_already_has_the_item(ec_role: str)
 
     assert output.num_scheduled_tokens[req_id] > 0
     assert not output.scheduled_encoder_inputs.get(req_id)
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_migration_gate_keeps_decode_and_preempted_resume_independent_of_pause(
+    async_scheduling,
+):
+    from vllm.v1.core.sched.interface import PauseState
+
+    scheduler = create_scheduler(async_scheduling=async_scheduling)
+    old, new = create_requests(num_requests=2)
+    scheduler.add_request(old)
+    output = scheduler.schedule()
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[old.request_id],
+            req_id_to_index={old.request_id: 0},
+            sampled_token_ids=[[1000]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    gate = scheduler.migration_admission_gate
+    gate.update("open", "test", requests=scheduler.requests.values())
+    scheduler.add_request(new)
+    output = scheduler.schedule()
+    assert old.request_id in output.num_scheduled_tokens
+    assert new.request_id not in output.num_scheduled_tokens
+    scheduler.set_pause_state(PauseState.PAUSED_ALL)
+    scheduler.set_pause_state(PauseState.UNPAUSED)
+    assert gate.status()["enabled"]
+    assert not gate.allows(new)
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[old.request_id],
+            req_id_to_index={old.request_id: 0},
+            sampled_token_ids=[[1001]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+    # A previously running request retains eligibility after preemption.
+    scheduler.running.remove(old)
+    scheduler._preempt_request(old, 0.0)
+    output = scheduler.schedule()
+    assert old.request_id in output.num_scheduled_tokens
+    assert new.request_id not in output.num_scheduled_tokens
+    scheduler.finish_requests(new.request_id, RequestStatus.FINISHED_ABORTED)
+    gate.update("close", "test")
+    assert new.request_id not in scheduler.requests

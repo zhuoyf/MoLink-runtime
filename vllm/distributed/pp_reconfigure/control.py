@@ -84,6 +84,8 @@ class ReconfigurationController:
             transaction_started = time.perf_counter()
             pause_started = None
             live_stats = None
+            original_capacity = None
+            capacity_shrunk = False
 
             async def phase(name, operation):
                 start = time.perf_counter()
@@ -115,10 +117,14 @@ class ReconfigurationController:
                 if await self.engine.is_paused():
                     raise ReconfigurationValidationError("engine is already paused")
                 descriptions = await phase("validate", lambda: rpc("describe"))
+                original_capacity = descriptions[0].get("num_blocks")
                 resize_restore = None
                 online = all(w.get("online_reconfiguration") for w in descriptions)
                 if online:
-                    shrink = min(w["max_intermediate_blocks"] for w in descriptions)
+                    shrink = min(
+                        min(w["max_intermediate_blocks"], w["max_final_blocks"])
+                        for w in descriptions
+                    )
                     resize_restore = min(w["max_final_blocks"] for w in descriptions)
                     if shrink < 2 or resize_restore < 2:
                         raise ReconfigurationValidationError(
@@ -130,6 +136,18 @@ class ReconfigurationController:
                             lambda: self.engine.engine_core.call_utility_async(
                                 "molink_resize_kv", shrink
                             ),
+                        )
+                        capacity_shrunk = True
+                    checked = await phase(
+                        "capacity_after_resize", lambda: rpc("describe")
+                    )
+                    if any(
+                        w["num_blocks"]
+                        > min(w["max_intermediate_blocks"], w["max_final_blocks"])
+                        for w in checked
+                    ):
+                        raise ReconfigurationValidationError(
+                            "physical peak capacity changed after KV resize"
                         )
                 if mode != "sync":
                     if not online:
@@ -332,6 +350,23 @@ class ReconfigurationController:
                     )
                 elif pause_attempted:
                     recovery = "pause state requires inspection"
+                if capacity_shrunk and recovery in (
+                    "unchanged",
+                    "rolled_back_and_resumed",
+                ):
+                    try:
+                        await phase(
+                            "restore_capacity_on_failure",
+                            lambda: self.engine.engine_core.call_utility_async(
+                                "molink_resize_kv", original_capacity
+                            ),
+                        )
+                    except Exception as capacity_error:
+                        write_event(
+                            directory,
+                            "capacity_restore_failed",
+                            error=str(capacity_error),
+                        )
                 write_event(
                     directory,
                     "transaction",

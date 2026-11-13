@@ -37,7 +37,25 @@ class HTTPController:
                 raise RuntimeError(f"{response.status}: {result}")
             return result
 
-    async def call_utility_async(self, method):
+    async def call_utility_async(self, method, *args):
+        if method == "molink_admission_gate":
+            if not args:
+                return await self.request("GET", "/molink/admission")
+            return await self.request(
+                "POST",
+                "/molink/admission",
+                {
+                    "action": args[0],
+                    "owner": args[1],
+                    "timeout": args[2] if len(args) > 2 else 10,
+                },
+            )
+        if method == "molink_migration_capacity":
+            return await self.request(
+                "GET", f"/molink/migration_capacity?boundary={args[0]}"
+            )
+        if method != "molink_resource_state":
+            raise ValueError(f"unsupported utility: {method}")
         result = await self.request("GET", "/molink/resource_status")
         self.version = result.get("configuration_version", self.version)
         return result
@@ -46,7 +64,9 @@ class HTTPController:
         async with self.lock:
             self.version += 1
             return await self.request(
-                "POST", "/molink/reconfigure", {"boundary": boundary, "mode": mode}
+                "POST",
+                "/molink/reconfigure",
+                {"boundary": boundary, "mode": mode, **kwargs},
             )
 
     async def state(self):

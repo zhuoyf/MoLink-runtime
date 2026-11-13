@@ -1,0 +1,142 @@
+[
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/gate-c16-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/gate-c32-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/gate-c64-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/memory-c16-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/memory-c32-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/memory-c64-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/failure-c16-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/failure-c32-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/failure-c64-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/auto-c16-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/auto-c32-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/auto-c64-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/comparison-c16-gate0-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/comparison-c16-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/comparison-c32-gate0-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/comparison-c32-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/comparison-c64-gate0-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/comparison-c64-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/comparison-confirmation/comparison-c16-gate0-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  },
+  {
+    "directory": "experiments/admission_control/results/validation-20261113/comparison-confirmation/comparison-c16-gate1-r0",
+    "gate_closed": true,
+    "requests_drained": true,
+    "used_blocks": 1,
+    "token_mismatches": 0
+  }
+]

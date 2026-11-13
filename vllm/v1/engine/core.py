@@ -1010,6 +1010,52 @@ class EngineCore:
     def set_weight_version(self, weight_version: str) -> None:
         self._weight_version = weight_version
 
+    def molink_admission_gate(self, action="status", owner=None, timeout=10):
+        gate = self.scheduler.migration_admission_gate
+        if action != "status":
+            gate.update(action, owner, timeout, self.scheduler.requests.values())
+        if gate.status()["enabled"]:
+            gate.observe(
+                sum(
+                    r.request_id not in gate.admitted
+                    for queue in (
+                        self.scheduler.waiting,
+                        self.scheduler.skipped_waiting,
+                    )
+                    for r in queue
+                )
+            )
+        return {
+            **gate.status(),
+            "running_requests": len(self.scheduler.running),
+            "waiting_requests": len(self.scheduler.waiting)
+            + len(self.scheduler.skipped_waiting),
+        }
+
+    def molink_migration_capacity(self, boundary):
+        from vllm.distributed.pp_reconfigure.control import validate_workers
+        from vllm.distributed.pp_reconfigure.resize import plan_resize
+
+        workers = self.molink_migrate("describe", boundary)
+        validate_workers(workers)
+        capacity = min(w["max_intermediate_blocks"] for w in workers)
+        final = min(w["max_final_blocks"] for w in workers)
+        pool = self.scheduler.kv_cache_manager.block_pool
+        feasible = capacity >= 2 and final >= 2
+        reason = "physical_capacity" if not feasible else "ready"
+        if feasible:
+            try:
+                plan_resize(pool, min(capacity, final, pool.num_gpu_blocks))
+            except ValueError:
+                feasible, reason = False, "referenced_kv_blocks"
+        return {
+            "feasible": feasible,
+            "reason": reason,
+            "workers": workers,
+            "capacity": min(capacity, final),
+            "num_blocks": pool.num_gpu_blocks,
+        }
+
     def molink_state(self, include_workers: bool = False) -> dict:
         from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -1018,9 +1064,10 @@ class EngineCore:
         pool = manager.block_pool
         state: dict[str, Any] = {
             "paused": self.is_scheduler_paused(),
+            "migration_admission_gate": self.molink_admission_gate(),
             "batch_queue_depth": len(self.batch_queue or ()),
             "running_requests": len(scheduler.running),
-            "waiting_requests": len(scheduler.waiting),
+            "waiting_requests": len(scheduler.waiting) + len(scheduler.skipped_waiting),
             "kv_cache_usage": manager.usage,
             "num_blocks": pool.num_gpu_blocks,
             "used_blocks": pool.num_gpu_blocks - pool.get_num_free_blocks(),
@@ -1063,7 +1110,7 @@ class EngineCore:
             Scheduler, self.scheduler
         ).kv_cache_manager.usage
         master["scheduler_paused"] = self.is_scheduler_paused()
-        master["waiting_requests"] = len(cast(Scheduler, self.scheduler).waiting)
+        master["waiting_requests"] = self.scheduler.get_request_counts()[1]
         master["running_requests"] = len(cast(Scheduler, self.scheduler).running)
         return master
 

@@ -1,0 +1,864 @@
+diff --git a/experiments/adaptive_pp/experiment.py b/experiments/adaptive_pp/experiment.py
+index 5ca9b82f3f..cd1e5b5c81 100644
+--- a/experiments/adaptive_pp/experiment.py
++++ b/experiments/adaptive_pp/experiment.py
+@@ -37,7 +37,25 @@ class HTTPController:
+                 raise RuntimeError(f"{response.status}: {result}")
+             return result
+ 
+-    async def call_utility_async(self, method):
++    async def call_utility_async(self, method, *args):
++        if method == "molink_admission_gate":
++            if not args:
++                return await self.request("GET", "/molink/admission")
++            return await self.request(
++                "POST",
++                "/molink/admission",
++                {
++                    "action": args[0],
++                    "owner": args[1],
++                    "timeout": args[2] if len(args) > 2 else 10,
++                },
++            )
++        if method == "molink_migration_capacity":
++            return await self.request(
++                "GET", f"/molink/migration_capacity?boundary={args[0]}"
++            )
++        if method != "molink_resource_state":
++            raise ValueError(f"unsupported utility: {method}")
+         result = await self.request("GET", "/molink/resource_status")
+         self.version = result.get("configuration_version", self.version)
+         return result
+@@ -46,7 +64,9 @@ class HTTPController:
+         async with self.lock:
+             self.version += 1
+             return await self.request(
+-                "POST", "/molink/reconfigure", {"boundary": boundary, "mode": mode}
++                "POST",
++                "/molink/reconfigure",
++                {"boundary": boundary, "mode": mode, **kwargs},
+             )
+ 
+     async def state(self):
+diff --git a/tests/v1/core/test_scheduler.py b/tests/v1/core/test_scheduler.py
+index 8bc06552c0..90f67a5d68 100644
+--- a/tests/v1/core/test_scheduler.py
++++ b/tests/v1/core/test_scheduler.py
+@@ -6313,3 +6313,56 @@ def test_encoder_input_skipped_when_connector_already_has_the_item(ec_role: str)
+ 
+     assert output.num_scheduled_tokens[req_id] > 0
+     assert not output.scheduled_encoder_inputs.get(req_id)
++
++
++@pytest.mark.parametrize("async_scheduling", [False, True])
++def test_migration_gate_keeps_decode_and_preempted_resume_independent_of_pause(
++    async_scheduling,
++):
++    from vllm.v1.core.sched.interface import PauseState
++
++    scheduler = create_scheduler(async_scheduling=async_scheduling)
++    old, new = create_requests(num_requests=2)
++    scheduler.add_request(old)
++    output = scheduler.schedule()
++    scheduler.update_from_output(
++        output,
++        ModelRunnerOutput(
++            req_ids=[old.request_id],
++            req_id_to_index={old.request_id: 0},
++            sampled_token_ids=[[1000]],
++            logprobs=None,
++            prompt_logprobs_dict={},
++            pooler_output=[],
++        ),
++    )
++    gate = scheduler.migration_admission_gate
++    gate.update("open", "test", requests=scheduler.requests.values())
++    scheduler.add_request(new)
++    output = scheduler.schedule()
++    assert old.request_id in output.num_scheduled_tokens
++    assert new.request_id not in output.num_scheduled_tokens
++    scheduler.set_pause_state(PauseState.PAUSED_ALL)
++    scheduler.set_pause_state(PauseState.UNPAUSED)
++    assert gate.status()["enabled"]
++    assert not gate.allows(new)
++    scheduler.update_from_output(
++        output,
++        ModelRunnerOutput(
++            req_ids=[old.request_id],
++            req_id_to_index={old.request_id: 0},
++            sampled_token_ids=[[1001]],
++            logprobs=None,
++            prompt_logprobs_dict={},
++            pooler_output=[],
++        ),
++    )
++    # A previously running request retains eligibility after preemption.
++    scheduler.running.remove(old)
++    scheduler._preempt_request(old, 0.0)
++    output = scheduler.schedule()
++    assert old.request_id in output.num_scheduled_tokens
++    assert new.request_id not in output.num_scheduled_tokens
++    scheduler.finish_requests(new.request_id, RequestStatus.FINISHED_ABORTED)
++    gate.update("close", "test")
++    assert new.request_id not in scheduler.requests
+diff --git a/tests/v1/worker/test_adaptive_pp.py b/tests/v1/worker/test_adaptive_pp.py
+index aae5af4e20..a676076d1c 100644
+--- a/tests/v1/worker/test_adaptive_pp.py
++++ b/tests/v1/worker/test_adaptive_pp.py
+@@ -364,3 +364,184 @@ def test_heterogeneity_budget_and_delay(monkeypatch):
+     assert sim.counters["prefill_tokens"] == 32
+     with pytest.raises(ValueError):
+         HeterogeneitySimulator(float("nan"))
++
++
++def test_admission_lease_expires_without_frontend_and_preserves_owner(monkeypatch):
++    from types import SimpleNamespace
++
++    from vllm.distributed.pp_reconfigure.admission import MigrationAdmissionGate
++
++    clock = [100.0]
++    monkeypatch.setattr(
++        "vllm.distributed.pp_reconfigure.admission.time.monotonic", lambda: clock[0]
++    )
++    gate = MigrationAdmissionGate()
++    old = SimpleNamespace(
++        request_id="old",
++        status=SimpleNamespace(name="RUNNING"),
++        num_preemptions=0,
++        num_computed_tokens=1,
++    )
++    new = SimpleNamespace(request_id="new")
++    gate.update("open", "owner", 10, [old])
++    assert gate.allows(old) and not gate.allows(new)
++    with pytest.raises(ValueError):
++        gate.update("close", "foreign")
++    with pytest.raises(ValueError):
++        gate.update("open", "foreign")
++    clock[0] += 11
++    assert gate.allows(new)
++    assert gate.status()["reason"] == "lease_expired"
++
++
++def test_reclaim_candidate_requires_empty_physical_fit_and_charges_wait():
++    state, model = scenario()
++    optimizer = PartitionOptimizer()
++    state.nodes[1].num_blocks = 10000
++    state.nodes[1].memory_budget = 330 << 20
++    assert optimizer.decide(state, model, 100)["target"] == 8
++    assert optimizer.decide(state, model, 100, reclaim=True)["target"] == 4
++    state.waiting = 64
++    assert (
++        optimizer.decide(state, model, 100, reclaim=True, gate_wait=10)["target"] == 8
++    )
++    state.waiting = 0
++    assert (
++        optimizer.decide(
++            state, model, 100, reclaim=True, gate_wait=10, queue_seconds=640
++        )["target"]
++        == 8
++    )
++    state.nodes[1].memory_budget = 130 << 20
++    assert optimizer.decide(state, model, 100, reclaim=True)["target"] == 8
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "failure",
++    [
++        "timeout",
++        "cancel",
++        "migration",
++        "version",
++        "benefit",
++        "success",
++        "smaller_target",
++        "open_ack_timeout",
++        "rpc_timeout",
++    ],
++)
++async def test_admission_recovery_all_paths(tmp_path, monkeypatch, failure):
++    import asyncio
++    from types import SimpleNamespace
++    from unittest.mock import AsyncMock
++
++    from vllm.distributed.pp_reconfigure.adaptive.runtime import AdaptiveScheduler
++    from vllm.distributed.pp_reconfigure.admission import MigrationAdmissionGate
++
++    state, model = scenario()
++    model.save(tmp_path / "profile.json")
++    gate = MigrationAdmissionGate()
++    control = SimpleNamespace(lock=asyncio.Lock(), version=0)
++    calls = []
++
++    async def rpc(method, *args):
++        calls.append(method)
++        if method == "molink_admission_gate":
++            if args:
++                result = gate.update(*args)
++                if failure == "open_ack_timeout" and args[0] == "open":
++                    await asyncio.Future()
++                return result
++            return {**gate.status(), "waiting_requests": 1}
++        if method == "molink_migration_capacity":
++            if failure == "rpc_timeout":
++                await asyncio.Future()
++            return {"feasible": calls.count(method) > 1 and failure != "timeout"}
++        if method == "molink_resource_state":
++            if failure == "cancel":
++                raise asyncio.CancelledError()
++            if failure == "version":
++                control.version += 1
++            return {}
++        raise AssertionError(method)
++
++    control.engine = SimpleNamespace(
++        engine_core=SimpleNamespace(call_utility_async=rpc)
++    )
++    control.reconfigure = AsyncMock(return_value={})
++    if failure == "migration":
++        control.reconfigure.side_effect = RuntimeError("injected failure")
++    runtime = AdaptiveScheduler(
++        control,
++        tmp_path / "profile.json",
++        tmp_path,
++        OptimizerConfig(admission_timeout=0.03, admission_poll_interval=0.01),
++    )
++    monkeypatch.setattr(runtime, "ingest", lambda *_: state)
++    monkeypatch.setattr(
++        runtime.optimizer,
++        "decide",
++        lambda *a, **kw: {
++            "target": 8
++            if failure == "benefit"
++            else 6
++            if failure == "smaller_target"
++            else 4
++        },
++    )
++    if failure in ("success", "smaller_target"):
++        await runtime.migrate_with_admission(state, {"target": 4})
++        control.reconfigure.assert_awaited_once_with(
++            6 if failure == "smaller_target" else 4,
++            "async",
++            expected_version=state.version,
++            expected_boundary=state.boundary,
++        )
++    else:
++        with pytest.raises(
++            (ValueError, RuntimeError, TimeoutError, asyncio.CancelledError)
++        ):
++            await runtime.migrate_with_admission(state, {"target": 4})
++    assert not gate.status()["enabled"]
++    assert not control.lock.locked()
++    assert runtime.admission_state == "NORMAL"
++
++
++@pytest.mark.asyncio
++async def test_admission_logging_failure_still_releases_gate(tmp_path, monkeypatch):
++    import asyncio
++    from types import SimpleNamespace
++    from unittest.mock import AsyncMock
++
++    from vllm.distributed.pp_reconfigure.adaptive.runtime import AdaptiveScheduler
++    from vllm.distributed.pp_reconfigure.admission import MigrationAdmissionGate
++
++    state, model = scenario()
++    model.save(tmp_path / "profile.json")
++    gate = MigrationAdmissionGate()
++
++    async def rpc(method, *args):
++        if method == "molink_migration_capacity":
++            return {"feasible": False}
++        return gate.update(*args) if args else gate.status()
++
++    control = SimpleNamespace(
++        lock=asyncio.Lock(),
++        version=0,
++        engine=SimpleNamespace(engine_core=SimpleNamespace(call_utility_async=rpc)),
++        reconfigure=AsyncMock(),
++    )
++    runtime = AdaptiveScheduler(control, tmp_path / "profile.json", tmp_path)
++    original = runtime.transition
++
++    def broken_log(phase, **details):
++        if phase in ("RECLAIMING", "RECOVERING"):
++            raise OSError("disk full")
++        original(phase, **details)
++
++    monkeypatch.setattr(runtime, "transition", broken_log)
++    with pytest.raises(OSError, match="disk full"):
++        await runtime.migrate_with_admission(state, {"target": 4})
++    assert not gate.status()["enabled"]
++    assert runtime.admission_state == "NORMAL"
+diff --git a/tests/v1/worker/test_pp_reconfigure.py b/tests/v1/worker/test_pp_reconfigure.py
+index c8bc34eb78..d62cd0b23d 100644
+--- a/tests/v1/worker/test_pp_reconfigure.py
++++ b/tests/v1/worker/test_pp_reconfigure.py
+@@ -1207,6 +1207,7 @@ async def test_async_streams_before_pause_and_syncs_before_commit(
+         return
+     result = await ReconfigurationController(engine, tmp_path).reconfigure(6, mode)
+     assert engine.calls == [
++        "describe",
+         "describe",
+         "prepare_live",
+         "prepared_live",
+@@ -1547,3 +1548,31 @@ def test_resource_monitor_defers_incomplete_cuda_reports_without_waiting(tmp_pat
+     monitor.collect_reports()
+     assert monitor.snapshot()["reports_received"] == {0: 1, 1: 1}
+     assert monitor.publish_seconds == 0.002
++
++
++@pytest.mark.parametrize(
++    "capacity,active,feasible", [(1, 0, False), (4, 4, False), (4, 2, True)]
++)
++def test_migration_preflight_requires_physical_and_referenced_kv_capacity(
++    capacity, active, feasible
++):
++    from vllm.v1.core.block_pool import BlockPool
++    from vllm.v1.engine.core import EngineCore
++
++    pool = BlockPool(8, enable_caching=True, hash_block_size=16)
++    pool.get_new_blocks(active)
++    core = SimpleNamespace(
++        scheduler=SimpleNamespace(kv_cache_manager=SimpleNamespace(block_pool=pool)),
++        molink_migrate=lambda *args: [
++            {
++                "ok": True,
++                "stage": stage,
++                "max_intermediate_blocks": capacity,
++                "max_final_blocks": 8,
++            }
++            for stage in (0, 1)
++        ],
++    )
++    result = EngineCore.molink_migration_capacity(core, 4)
++    assert result["feasible"] is feasible
++    assert pool.num_gpu_blocks == 8  # Preflight never frees referenced storage.
+diff --git a/vllm/distributed/pp_reconfigure/adaptive/optimizer.py b/vllm/distributed/pp_reconfigure/adaptive/optimizer.py
+index c921d0208f..39f3094b06 100644
+--- a/vllm/distributed/pp_reconfigure/adaptive/optimizer.py
++++ b/vllm/distributed/pp_reconfigure/adaptive/optimizer.py
+@@ -16,8 +16,16 @@ class OptimizerConfig:
+     stale_seconds: float = 10
+     memory_reserve: int = 128 << 20
+     security_mode: str = "off"
++    admission_control: bool = True
++    admission_timeout: float = 10
++    admission_poll_interval: float = 0.25
+ 
+     def __post_init__(self):
++        if not all(
++            math.isfinite(x) and 0 < x <= 600
++            for x in (self.admission_timeout, self.admission_poll_interval)
++        ):
++            raise ValueError("invalid admission timeout or poll interval")
+         if self.stack_size < 1 or self.memory_reserve < (128 << 20):
+             raise ValueError("invalid stack size or memory reserve")
+         if not all(
+@@ -47,7 +55,7 @@ class PartitionOptimizer:
+         direction = "1to0" if target > old else "0to1"
+         return f"migration/{direction}/{abs(target - old)}/{bucket(kv_bytes)}"
+ 
+-    def evaluate(self, state, model, boundary, now):
++    def evaluate(self, state, model, boundary, now, *, reclaim=False):
+         cfg = self.config
+         plan = PlacementPlan(
+             boundary,
+@@ -118,6 +126,15 @@ class PartitionOptimizer:
+                 moving_bytes = (
+                     incoming * node.transfer_bytes_per_block * node.used_blocks
+                 )
++            if reclaim and boundary != state.boundary:
++                # Only test whether an empty pool could fit; the executor still
++                # requires measured physical capacity before any migration.
++                peak = (
++                    node.non_kv_bytes
++                    + incoming * node.weight_bytes_per_layer
++                    + max(target, node.layers) * node.kv_bytes_per_layer_block * 2
++                    + cfg.memory_reserve
++                )
+             if boundary != state.boundary and peak > node.memory_budget:
+                 return {
+                     "boundary": boundary,
+@@ -135,7 +152,7 @@ class PartitionOptimizer:
+         )
+         # Risk is a proxy for lost service, separate from measured preemptions.
+         risk = min(1.0, max(0, projected - capacity + 1) / max(1, projected))
+-        if boundary != state.boundary and capacity <= used:
++        if boundary != state.boundary and capacity <= (1 if reclaim else used):
+             return {
+                 "boundary": boundary,
+                 "valid": False,
+@@ -200,7 +217,9 @@ class PartitionOptimizer:
+             "security_seconds": security_seconds,
+         }
+ 
+-    def decide(self, state, model, now):
++    def decide(
++        self, state, model, now, *, reclaim=False, gate_wait=0, queue_seconds=None
++    ):
+         result = {
+             "state": asdict(state),
+             "candidates": [],
+@@ -231,7 +250,7 @@ class PartitionOptimizer:
+             self.config.stack_size, state.total_layers, self.config.stack_size
+         ):
+             try:
+-                candidate = self.evaluate(state, model, boundary, now)
++                candidate = self.evaluate(state, model, boundary, now, reclaim=reclaim)
+             except ValueError as exc:
+                 candidate = {"boundary": boundary, "valid": False, "reason": str(exc)}
+             result["candidates"].append(candidate)
+@@ -258,6 +277,17 @@ class PartitionOptimizer:
+                     + pause
+                     + max(0, transition - pause) * c["interference"]
+                     + c["security_seconds"]
++                    + (
++                        gate_wait
++                        + (
++                            gate_wait * state.waiting
++                            if queue_seconds is None
++                            else queue_seconds
++                        )
++                        / max(1, state.running or state.batch)
++                        if c["boundary"] != state.boundary
++                        else 0
++                    )
+                 )
+         errors = [
+             e.relative_error
+diff --git a/vllm/distributed/pp_reconfigure/adaptive/runtime.py b/vllm/distributed/pp_reconfigure/adaptive/runtime.py
+index 3110a652f9..4b8827b610 100644
+--- a/vllm/distributed/pp_reconfigure/adaptive/runtime.py
++++ b/vllm/distributed/pp_reconfigure/adaptive/runtime.py
+@@ -3,6 +3,7 @@
+ import asyncio
+ import math
+ import time
++import uuid
+ from dataclasses import asdict
+ 
+ from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
+@@ -32,6 +33,8 @@ class AdaptiveScheduler:
+         self.latest = None
+         self.task = None
+         self.stopping = False
++        self.admission_state = "NORMAL"
++        self.admission_lock = asyncio.Lock()
+ 
+     def ingest(self, reports, version):
+         now = time.time()
+@@ -190,7 +193,119 @@ class AdaptiveScheduler:
+         self.not_before = now
+         self.previous = None
+ 
++    def transition(self, state, **details):
++        self.admission_state = state
++        write_event(self.log_dir, "admission", state=state, **details)
++
++    async def migrate_with_admission(self, state, decision):
++        cfg = self.optimizer.config
++        rpc = self.controller.engine.engine_core.call_utility_async
++        owner = uuid.uuid4().hex
++        opened = False
++        started = time.monotonic()
++        queue_seconds = 0.0
++        try:
++            async with asyncio.timeout(cfg.admission_timeout), self.controller.lock:
++                self.transition("PREPARING", target=decision["target"])
++                while True:
++                    if self.stopping or self.controller.version != state.version:
++                        raise ReconfigurationValidationError(
++                            "admission cancelled or configuration changed"
++                        )
++                    capacity = await rpc(
++                        "molink_migration_capacity", decision["target"]
++                    )
++                    elapsed = time.monotonic() - started
++                    if capacity["feasible"]:
++                        break
++                    if not cfg.admission_control or elapsed >= cfg.admission_timeout:
++                        raise ReconfigurationValidationError(
++                            "admission capacity timeout"
++                        )
++                    if not opened:
++                        # Cancellation can race the RPC acknowledgement.
++                        opened = True
++                        await rpc(
++                            "molink_admission_gate",
++                            "open",
++                            owner,
++                            cfg.admission_timeout - elapsed,
++                        )
++                        self.transition("RECLAIMING", capacity=capacity)
++                    await asyncio.sleep(cfg.admission_poll_interval)
++                    gate = await rpc("molink_admission_gate")
++                    if gate["owner"] != owner:
++                        raise ReconfigurationValidationError(
++                            "admission lease expired or cancelled"
++                        )
++                    queue_seconds = gate["queue_seconds"]
++                    reports = await rpc("molink_resource_state")
++                    state = await asyncio.to_thread(self.ingest, reports, state.version)
++                    decision = self.optimizer.decide(
++                        state,
++                        self.model,
++                        time.time(),
++                        reclaim=True,
++                        gate_wait=time.monotonic() - started,
++                        queue_seconds=queue_seconds,
++                    )
++                    self.latest = decision
++                    self.transition(
++                        "RECLAIMING",
++                        decision=decision,
++                        queue_seconds=queue_seconds,
++                        gate=gate,
++                    )
++                    if decision["target"] == state.boundary:
++                        raise ReconfigurationValidationError(
++                            "admission benefit no longer sufficient"
++                        )
++                if opened:
++                    # Bounded independently by EngineCore even if the frontend dies.
++                    # Existing executor deadlines are 180 + 180 + 60 seconds.
++                    await rpc("molink_admission_gate", "renew", owner, 480)
++                self.transition(
++                    "MIGRATING",
++                    capacity=capacity,
++                    gate_wait_seconds=time.monotonic() - started,
++                )
++            result = await self.controller.reconfigure(
++                decision["target"],
++                "async",
++                expected_version=state.version,
++                expected_boundary=state.boundary,
++            )
++            if opened:
++                gate = await rpc("molink_admission_gate")
++                queue_seconds = gate.get("queue_seconds", queue_seconds)
++            result["admission_queue_seconds"] = queue_seconds
++            result["admission_seconds"] = time.monotonic() - started if opened else 0
++            return state, decision, result
++        finally:
++            try:
++                self.transition("RECOVERING")
++            finally:
++                try:
++                    if opened:
++                        await asyncio.shield(
++                            asyncio.wait_for(
++                                rpc("molink_admission_gate", "close", owner), timeout=2
++                            )
++                        )
++                finally:
++                    self.transition(
++                        "NORMAL",
++                        duration_seconds=time.monotonic() - started,
++                        queue_seconds=queue_seconds,
++                    )
++
+     async def tick(self):
++        if self.admission_lock.locked():
++            return
++        async with self.admission_lock:
++            await self._tick()
++
++    async def _tick(self):
+         if self.controller.lock.locked():
+             return
+         version = self.controller.version
+@@ -224,17 +339,38 @@ class AdaptiveScheduler:
+         decision = await asyncio.to_thread(
+             self.optimizer.decide, state, self.model, time.time()
+         )
++        if self.optimizer.config.admission_control and any(
++            c.get("reason") in ("intermediate_memory", "target_kv_capacity")
++            for c in decision["candidates"]
++        ):
++            reclaim = self.optimizer.decide(
++                state,
++                self.model,
++                time.time(),
++                reclaim=True,
++                gate_wait=self.optimizer.config.admission_timeout,
++            )
++
++            def selected_cost(choice):
++                return next(
++                    (
++                        c.get("cost_seconds", math.inf)
++                        for c in choice["candidates"]
++                        if c["boundary"] == choice["target"]
++                    ),
++                    math.inf,
++                )
++
++            if selected_cost(reclaim) < selected_cost(decision):
++                decision = reclaim
+         self.latest = decision
+         await asyncio.to_thread(write_event, self.log_dir, "decision", **decision)
+         if decision["target"] != state.boundary:
+             try:
+-                result = await self.controller.reconfigure(
+-                    decision["target"],
+-                    "async",
+-                    expected_version=state.version,
+-                    expected_boundary=state.boundary,
++                state, decision, result = await self.migrate_with_admission(
++                    state, decision
+                 )
+-            except ReconfigurationValidationError as exc:
++            except (ReconfigurationValidationError, TimeoutError) as exc:
+                 await asyncio.to_thread(
+                     write_event,
+                     self.log_dir,
+@@ -290,6 +426,7 @@ class AdaptiveScheduler:
+         return {
+             "running": self.task is not None and not self.task.done(),
+             "failure_latched": self.optimizer.failed,
++            "admission_state": self.admission_state,
+             "latest": self.latest,
+             "config": asdict(self.optimizer.config),
+             "model_buckets": len(self.model.estimates),
+diff --git a/vllm/distributed/pp_reconfigure/control.py b/vllm/distributed/pp_reconfigure/control.py
+index 689bd3d04c..c7b4089876 100644
+--- a/vllm/distributed/pp_reconfigure/control.py
++++ b/vllm/distributed/pp_reconfigure/control.py
+@@ -84,6 +84,8 @@ class ReconfigurationController:
+             transaction_started = time.perf_counter()
+             pause_started = None
+             live_stats = None
++            original_capacity = None
++            capacity_shrunk = False
+ 
+             async def phase(name, operation):
+                 start = time.perf_counter()
+@@ -115,10 +117,14 @@ class ReconfigurationController:
+                 if await self.engine.is_paused():
+                     raise ReconfigurationValidationError("engine is already paused")
+                 descriptions = await phase("validate", lambda: rpc("describe"))
++                original_capacity = descriptions[0].get("num_blocks")
+                 resize_restore = None
+                 online = all(w.get("online_reconfiguration") for w in descriptions)
+                 if online:
+-                    shrink = min(w["max_intermediate_blocks"] for w in descriptions)
++                    shrink = min(
++                        min(w["max_intermediate_blocks"], w["max_final_blocks"])
++                        for w in descriptions
++                    )
+                     resize_restore = min(w["max_final_blocks"] for w in descriptions)
+                     if shrink < 2 or resize_restore < 2:
+                         raise ReconfigurationValidationError(
+@@ -131,6 +137,18 @@ class ReconfigurationController:
+                                 "molink_resize_kv", shrink
+                             ),
+                         )
++                        capacity_shrunk = True
++                    checked = await phase(
++                        "capacity_after_resize", lambda: rpc("describe")
++                    )
++                    if any(
++                        w["num_blocks"]
++                        > min(w["max_intermediate_blocks"], w["max_final_blocks"])
++                        for w in checked
++                    ):
++                        raise ReconfigurationValidationError(
++                            "physical peak capacity changed after KV resize"
++                        )
+                 if mode != "sync":
+                     if not online:
+                         raise ReconfigurationValidationError(
+@@ -332,6 +350,23 @@ class ReconfigurationController:
+                     )
+                 elif pause_attempted:
+                     recovery = "pause state requires inspection"
++                if capacity_shrunk and recovery in (
++                    "unchanged",
++                    "rolled_back_and_resumed",
++                ):
++                    try:
++                        await phase(
++                            "restore_capacity_on_failure",
++                            lambda: self.engine.engine_core.call_utility_async(
++                                "molink_resize_kv", original_capacity
++                            ),
++                        )
++                    except Exception as capacity_error:
++                        write_event(
++                            directory,
++                            "capacity_restore_failed",
++                            error=str(capacity_error),
++                        )
+                 write_event(
+                     directory,
+                     "transaction",
+diff --git a/vllm/entrypoints/serve/dev/molink/api_router.py b/vllm/entrypoints/serve/dev/molink/api_router.py
+index 062b546fca..39bc9fadf3 100644
+--- a/vllm/entrypoints/serve/dev/molink/api_router.py
++++ b/vllm/entrypoints/serve/dev/molink/api_router.py
+@@ -95,6 +95,45 @@ async def resize_kv(body: ResizeRequest, request: Request):
+             raise HTTPException(status_code=409, detail=str(exc)) from exc
+ 
+ 
++@router.get("/migration_capacity")
++async def migration_capacity(boundary: int, request: Request):
++    control = controller(request)
++    if control.lock.locked():
++        raise HTTPException(
++            status_code=409, detail="a reconfiguration is already running"
++        )
++    async with control.lock:
++        try:
++            return await control.engine.engine_core.call_utility_async(
++                "molink_migration_capacity", boundary
++            )
++        except ValueError as exc:
++            raise HTTPException(status_code=409, detail=str(exc)) from exc
++
++
++class AdmissionRequest(BaseModel):
++    action: Literal["open", "close", "renew"]
++    owner: str
++    timeout: float = 10
++
++
++@router.get("/admission")
++async def admission_status(request: Request):
++    return await controller(request).engine.engine_core.call_utility_async(
++        "molink_admission_gate"
++    )
++
++
++@router.post("/admission")
++async def admission_update(body: AdmissionRequest, request: Request):
++    try:
++        return await controller(request).engine.engine_core.call_utility_async(
++            "molink_admission_gate", body.action, body.owner, body.timeout
++        )
++    except ValueError as exc:
++        raise HTTPException(status_code=409, detail=str(exc)) from exc
++
++
+ class SimulationRequest(BaseModel):
+     stages: list[dict]
+     target_boundary: StrictInt | None = None
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 3551722a2d..cc9f2dec97 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -490,6 +490,9 @@ class Scheduler(SchedulerInterface):
+             # schedule() frees the blocks (async scheduling race).
+             self._re_block_ids: dict[str, list[int]] = {}
+ 
++        from vllm.distributed.pp_reconfigure.admission import MigrationAdmissionGate
++
++        self.migration_admission_gate = MigrationAdmissionGate()
+         self._pause_state: PauseState = PauseState.UNPAUSED
+ 
+         # In-flight requests still prefilling (prefill chunks + in-progress
+@@ -612,6 +615,15 @@ class Scheduler(SchedulerInterface):
+         return max(num_new_tokens, 0)
+ 
+     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
++        gate = self.migration_admission_gate
++        if gate.status()["enabled"]:
++            gate.observe(
++                sum(
++                    r.request_id not in gate.admitted
++                    for queue in (self.waiting, self.skipped_waiting)
++                    for r in queue
++                )
++            )
+         self.current_step += 1
+         # NOTE(woosuk) on the scheduling algorithm:
+         # There's no "decoding phase" nor "prefill phase" in the scheduler.
+@@ -1096,6 +1108,10 @@ class Scheduler(SchedulerInterface):
+                             request_queue.remove_request(small)
+                             request_queue.prepend_request(small)
+                             request = request_queue.peek_request()
++                if not self.migration_admission_gate.allows(request):
++                    request_queue.pop_request()
++                    step_skipped_waiting.prepend_request(request)
++                    continue
+                 request_id = request.request_id
+ 
+                 # try to promote blocked statuses while traversing skipped queue.
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index dee4a41b9c..1e3ec514cf 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -1010,6 +1010,52 @@ class EngineCore:
+     def set_weight_version(self, weight_version: str) -> None:
+         self._weight_version = weight_version
+ 
++    def molink_admission_gate(self, action="status", owner=None, timeout=10):
++        gate = self.scheduler.migration_admission_gate
++        if action != "status":
++            gate.update(action, owner, timeout, self.scheduler.requests.values())
++        if gate.status()["enabled"]:
++            gate.observe(
++                sum(
++                    r.request_id not in gate.admitted
++                    for queue in (
++                        self.scheduler.waiting,
++                        self.scheduler.skipped_waiting,
++                    )
++                    for r in queue
++                )
++            )
++        return {
++            **gate.status(),
++            "running_requests": len(self.scheduler.running),
++            "waiting_requests": len(self.scheduler.waiting)
++            + len(self.scheduler.skipped_waiting),
++        }
++
++    def molink_migration_capacity(self, boundary):
++        from vllm.distributed.pp_reconfigure.control import validate_workers
++        from vllm.distributed.pp_reconfigure.resize import plan_resize
++
++        workers = self.molink_migrate("describe", boundary)
++        validate_workers(workers)
++        capacity = min(w["max_intermediate_blocks"] for w in workers)
++        final = min(w["max_final_blocks"] for w in workers)
++        pool = self.scheduler.kv_cache_manager.block_pool
++        feasible = capacity >= 2 and final >= 2
++        reason = "physical_capacity" if not feasible else "ready"
++        if feasible:
++            try:
++                plan_resize(pool, min(capacity, final, pool.num_gpu_blocks))
++            except ValueError:
++                feasible, reason = False, "referenced_kv_blocks"
++        return {
++            "feasible": feasible,
++            "reason": reason,
++            "workers": workers,
++            "capacity": min(capacity, final),
++            "num_blocks": pool.num_gpu_blocks,
++        }
++
+     def molink_state(self, include_workers: bool = False) -> dict:
+         from vllm.v1.core.sched.scheduler import Scheduler
+ 
+@@ -1018,9 +1064,10 @@ class EngineCore:
+         pool = manager.block_pool
+         state: dict[str, Any] = {
+             "paused": self.is_scheduler_paused(),
++            "migration_admission_gate": self.molink_admission_gate(),
+             "batch_queue_depth": len(self.batch_queue or ()),
+             "running_requests": len(scheduler.running),
+-            "waiting_requests": len(scheduler.waiting),
++            "waiting_requests": len(scheduler.waiting) + len(scheduler.skipped_waiting),
+             "kv_cache_usage": manager.usage,
+             "num_blocks": pool.num_gpu_blocks,
+             "used_blocks": pool.num_gpu_blocks - pool.get_num_free_blocks(),
+@@ -1063,7 +1110,7 @@ class EngineCore:
+             Scheduler, self.scheduler
+         ).kv_cache_manager.usage
+         master["scheduler_paused"] = self.is_scheduler_paused()
+-        master["waiting_requests"] = len(cast(Scheduler, self.scheduler).waiting)
++        master["waiting_requests"] = self.scheduler.get_request_counts()[1]
+         master["running_requests"] = len(cast(Scheduler, self.scheduler).running)
+         return master
+ 

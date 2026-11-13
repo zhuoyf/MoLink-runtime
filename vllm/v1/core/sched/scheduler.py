@@ -490,6 +490,9 @@ class Scheduler(SchedulerInterface):
             # schedule() frees the blocks (async scheduling race).
             self._re_block_ids: dict[str, list[int]] = {}
 
+        from vllm.distributed.pp_reconfigure.admission import MigrationAdmissionGate
+
+        self.migration_admission_gate = MigrationAdmissionGate()
         self._pause_state: PauseState = PauseState.UNPAUSED
 
         # In-flight requests still prefilling (prefill chunks + in-progress
@@ -612,6 +615,15 @@ class Scheduler(SchedulerInterface):
         return max(num_new_tokens, 0)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        gate = self.migration_admission_gate
+        if gate.status()["enabled"]:
+            gate.observe(
+                sum(
+                    r.request_id not in gate.admitted
+                    for queue in (self.waiting, self.skipped_waiting)
+                    for r in queue
+                )
+            )
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -1096,6 +1108,10 @@ class Scheduler(SchedulerInterface):
                             request_queue.remove_request(small)
                             request_queue.prepend_request(small)
                             request = request_queue.peek_request()
+                if not self.migration_admission_gate.allows(request):
+                    request_queue.pop_request()
+                    step_skipped_waiting.prepend_request(request)
+                    continue
                 request_id = request.request_id
 
                 # try to promote blocked statuses while traversing skipped queue.

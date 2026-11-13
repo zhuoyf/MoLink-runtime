@@ -3,6 +3,7 @@
 import asyncio
 import math
 import time
+import uuid
 from dataclasses import asdict
 
 from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
@@ -32,6 +33,8 @@ class AdaptiveScheduler:
         self.latest = None
         self.task = None
         self.stopping = False
+        self.admission_state = "NORMAL"
+        self.admission_lock = asyncio.Lock()
 
     def ingest(self, reports, version):
         now = time.time()
@@ -190,7 +193,119 @@ class AdaptiveScheduler:
         self.not_before = now
         self.previous = None
 
+    def transition(self, state, **details):
+        self.admission_state = state
+        write_event(self.log_dir, "admission", state=state, **details)
+
+    async def migrate_with_admission(self, state, decision):
+        cfg = self.optimizer.config
+        rpc = self.controller.engine.engine_core.call_utility_async
+        owner = uuid.uuid4().hex
+        opened = False
+        started = time.monotonic()
+        queue_seconds = 0.0
+        try:
+            async with asyncio.timeout(cfg.admission_timeout), self.controller.lock:
+                self.transition("PREPARING", target=decision["target"])
+                while True:
+                    if self.stopping or self.controller.version != state.version:
+                        raise ReconfigurationValidationError(
+                            "admission cancelled or configuration changed"
+                        )
+                    capacity = await rpc(
+                        "molink_migration_capacity", decision["target"]
+                    )
+                    elapsed = time.monotonic() - started
+                    if capacity["feasible"]:
+                        break
+                    if not cfg.admission_control or elapsed >= cfg.admission_timeout:
+                        raise ReconfigurationValidationError(
+                            "admission capacity timeout"
+                        )
+                    if not opened:
+                        # Cancellation can race the RPC acknowledgement.
+                        opened = True
+                        await rpc(
+                            "molink_admission_gate",
+                            "open",
+                            owner,
+                            cfg.admission_timeout - elapsed,
+                        )
+                        self.transition("RECLAIMING", capacity=capacity)
+                    await asyncio.sleep(cfg.admission_poll_interval)
+                    gate = await rpc("molink_admission_gate")
+                    if gate["owner"] != owner:
+                        raise ReconfigurationValidationError(
+                            "admission lease expired or cancelled"
+                        )
+                    queue_seconds = gate["queue_seconds"]
+                    reports = await rpc("molink_resource_state")
+                    state = await asyncio.to_thread(self.ingest, reports, state.version)
+                    decision = self.optimizer.decide(
+                        state,
+                        self.model,
+                        time.time(),
+                        reclaim=True,
+                        gate_wait=time.monotonic() - started,
+                        queue_seconds=queue_seconds,
+                    )
+                    self.latest = decision
+                    self.transition(
+                        "RECLAIMING",
+                        decision=decision,
+                        queue_seconds=queue_seconds,
+                        gate=gate,
+                    )
+                    if decision["target"] == state.boundary:
+                        raise ReconfigurationValidationError(
+                            "admission benefit no longer sufficient"
+                        )
+                if opened:
+                    # Bounded independently by EngineCore even if the frontend dies.
+                    # Existing executor deadlines are 180 + 180 + 60 seconds.
+                    await rpc("molink_admission_gate", "renew", owner, 480)
+                self.transition(
+                    "MIGRATING",
+                    capacity=capacity,
+                    gate_wait_seconds=time.monotonic() - started,
+                )
+            result = await self.controller.reconfigure(
+                decision["target"],
+                "async",
+                expected_version=state.version,
+                expected_boundary=state.boundary,
+            )
+            if opened:
+                gate = await rpc("molink_admission_gate")
+                queue_seconds = gate.get("queue_seconds", queue_seconds)
+            result["admission_queue_seconds"] = queue_seconds
+            result["admission_seconds"] = time.monotonic() - started if opened else 0
+            return state, decision, result
+        finally:
+            try:
+                self.transition("RECOVERING")
+            finally:
+                try:
+                    if opened:
+                        await asyncio.shield(
+                            asyncio.wait_for(
+                                rpc("molink_admission_gate", "close", owner), timeout=2
+                            )
+                        )
+                finally:
+                    self.transition(
+                        "NORMAL",
+                        duration_seconds=time.monotonic() - started,
+                        queue_seconds=queue_seconds,
+                    )
+
     async def tick(self):
+        if self.admission_lock.locked():
+            return
+        async with self.admission_lock:
+            await self._tick()
+
+    async def _tick(self):
         if self.controller.lock.locked():
             return
         version = self.controller.version
@@ -224,17 +339,38 @@ class AdaptiveScheduler:
         decision = await asyncio.to_thread(
             self.optimizer.decide, state, self.model, time.time()
         )
+        if self.optimizer.config.admission_control and any(
+            c.get("reason") in ("intermediate_memory", "target_kv_capacity")
+            for c in decision["candidates"]
+        ):
+            reclaim = self.optimizer.decide(
+                state,
+                self.model,
+                time.time(),
+                reclaim=True,
+                gate_wait=self.optimizer.config.admission_timeout,
+            )
+
+            def selected_cost(choice):
+                return next(
+                    (
+                        c.get("cost_seconds", math.inf)
+                        for c in choice["candidates"]
+                        if c["boundary"] == choice["target"]
+                    ),
+                    math.inf,
+                )
+
+            if selected_cost(reclaim) < selected_cost(decision):
+                decision = reclaim
         self.latest = decision
         await asyncio.to_thread(write_event, self.log_dir, "decision", **decision)
         if decision["target"] != state.boundary:
             try:
-                result = await self.controller.reconfigure(
-                    decision["target"],
-                    "async",
-                    expected_version=state.version,
-                    expected_boundary=state.boundary,
+                state, decision, result = await self.migrate_with_admission(
+                    state, decision
                 )
-            except ReconfigurationValidationError as exc:
+            except (ReconfigurationValidationError, TimeoutError) as exc:
                 await asyncio.to_thread(
                     write_event,
                     self.log_dir,
@@ -290,6 +426,7 @@ class AdaptiveScheduler:
         return {
             "running": self.task is not None and not self.task.done(),
             "failure_latched": self.optimizer.failed,
+            "admission_state": self.admission_state,
             "latest": self.latest,
             "config": asdict(self.optimizer.config),
             "model_buckets": len(self.model.estimates),

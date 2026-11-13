@@ -1208,6 +1208,7 @@ async def test_async_streams_before_pause_and_syncs_before_commit(
     result = await ReconfigurationController(engine, tmp_path).reconfigure(6, mode)
     assert engine.calls == [
         "describe",
+        "describe",
         "prepare_live",
         "prepared_live",
         start_action,
@@ -1547,3 +1548,31 @@ def test_resource_monitor_defers_incomplete_cuda_reports_without_waiting(tmp_pat
     monitor.collect_reports()
     assert monitor.snapshot()["reports_received"] == {0: 1, 1: 1}
     assert monitor.publish_seconds == 0.002
+
+
+@pytest.mark.parametrize(
+    "capacity,active,feasible", [(1, 0, False), (4, 4, False), (4, 2, True)]
+)
+def test_migration_preflight_requires_physical_and_referenced_kv_capacity(
+    capacity, active, feasible
+):
+    from vllm.v1.core.block_pool import BlockPool
+    from vllm.v1.engine.core import EngineCore
+
+    pool = BlockPool(8, enable_caching=True, hash_block_size=16)
+    pool.get_new_blocks(active)
+    core = SimpleNamespace(
+        scheduler=SimpleNamespace(kv_cache_manager=SimpleNamespace(block_pool=pool)),
+        molink_migrate=lambda *args: [
+            {
+                "ok": True,
+                "stage": stage,
+                "max_intermediate_blocks": capacity,
+                "max_final_blocks": 8,
+            }
+            for stage in (0, 1)
+        ],
+    )
+    result = EngineCore.molink_migration_capacity(core, 4)
+    assert result["feasible"] is feasible
+    assert pool.num_gpu_blocks == 8  # Preflight never frees referenced storage.

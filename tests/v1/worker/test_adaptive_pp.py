@@ -364,3 +364,184 @@ def test_heterogeneity_budget_and_delay(monkeypatch):
     assert sim.counters["prefill_tokens"] == 32
     with pytest.raises(ValueError):
         HeterogeneitySimulator(float("nan"))
+
+
+def test_admission_lease_expires_without_frontend_and_preserves_owner(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm.distributed.pp_reconfigure.admission import MigrationAdmissionGate
+
+    clock = [100.0]
+    monkeypatch.setattr(
+        "vllm.distributed.pp_reconfigure.admission.time.monotonic", lambda: clock[0]
+    )
+    gate = MigrationAdmissionGate()
+    old = SimpleNamespace(
+        request_id="old",
+        status=SimpleNamespace(name="RUNNING"),
+        num_preemptions=0,
+        num_computed_tokens=1,
+    )
+    new = SimpleNamespace(request_id="new")
+    gate.update("open", "owner", 10, [old])
+    assert gate.allows(old) and not gate.allows(new)
+    with pytest.raises(ValueError):
+        gate.update("close", "foreign")
+    with pytest.raises(ValueError):
+        gate.update("open", "foreign")
+    clock[0] += 11
+    assert gate.allows(new)
+    assert gate.status()["reason"] == "lease_expired"
+
+
+def test_reclaim_candidate_requires_empty_physical_fit_and_charges_wait():
+    state, model = scenario()
+    optimizer = PartitionOptimizer()
+    state.nodes[1].num_blocks = 10000
+    state.nodes[1].memory_budget = 330 << 20
+    assert optimizer.decide(state, model, 100)["target"] == 8
+    assert optimizer.decide(state, model, 100, reclaim=True)["target"] == 4
+    state.waiting = 64
+    assert (
+        optimizer.decide(state, model, 100, reclaim=True, gate_wait=10)["target"] == 8
+    )
+    state.waiting = 0
+    assert (
+        optimizer.decide(
+            state, model, 100, reclaim=True, gate_wait=10, queue_seconds=640
+        )["target"]
+        == 8
+    )
+    state.nodes[1].memory_budget = 130 << 20
+    assert optimizer.decide(state, model, 100, reclaim=True)["target"] == 8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "timeout",
+        "cancel",
+        "migration",
+        "version",
+        "benefit",
+        "success",
+        "smaller_target",
+        "open_ack_timeout",
+        "rpc_timeout",
+    ],
+)
+async def test_admission_recovery_all_paths(tmp_path, monkeypatch, failure):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from vllm.distributed.pp_reconfigure.adaptive.runtime import AdaptiveScheduler
+    from vllm.distributed.pp_reconfigure.admission import MigrationAdmissionGate
+
+    state, model = scenario()
+    model.save(tmp_path / "profile.json")
+    gate = MigrationAdmissionGate()
+    control = SimpleNamespace(lock=asyncio.Lock(), version=0)
+    calls = []
+
+    async def rpc(method, *args):
+        calls.append(method)
+        if method == "molink_admission_gate":
+            if args:
+                result = gate.update(*args)
+                if failure == "open_ack_timeout" and args[0] == "open":
+                    await asyncio.Future()
+                return result
+            return {**gate.status(), "waiting_requests": 1}
+        if method == "molink_migration_capacity":
+            if failure == "rpc_timeout":
+                await asyncio.Future()
+            return {"feasible": calls.count(method) > 1 and failure != "timeout"}
+        if method == "molink_resource_state":
+            if failure == "cancel":
+                raise asyncio.CancelledError()
+            if failure == "version":
+                control.version += 1
+            return {}
+        raise AssertionError(method)
+
+    control.engine = SimpleNamespace(
+        engine_core=SimpleNamespace(call_utility_async=rpc)
+    )
+    control.reconfigure = AsyncMock(return_value={})
+    if failure == "migration":
+        control.reconfigure.side_effect = RuntimeError("injected failure")
+    runtime = AdaptiveScheduler(
+        control,
+        tmp_path / "profile.json",
+        tmp_path,
+        OptimizerConfig(admission_timeout=0.03, admission_poll_interval=0.01),
+    )
+    monkeypatch.setattr(runtime, "ingest", lambda *_: state)
+    monkeypatch.setattr(
+        runtime.optimizer,
+        "decide",
+        lambda *a, **kw: {
+            "target": 8
+            if failure == "benefit"
+            else 6
+            if failure == "smaller_target"
+            else 4
+        },
+    )
+    if failure in ("success", "smaller_target"):
+        await runtime.migrate_with_admission(state, {"target": 4})
+        control.reconfigure.assert_awaited_once_with(
+            6 if failure == "smaller_target" else 4,
+            "async",
+            expected_version=state.version,
+            expected_boundary=state.boundary,
+        )
+    else:
+        with pytest.raises(
+            (ValueError, RuntimeError, TimeoutError, asyncio.CancelledError)
+        ):
+            await runtime.migrate_with_admission(state, {"target": 4})
+    assert not gate.status()["enabled"]
+    assert not control.lock.locked()
+    assert runtime.admission_state == "NORMAL"
+
+
+@pytest.mark.asyncio
+async def test_admission_logging_failure_still_releases_gate(tmp_path, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from vllm.distributed.pp_reconfigure.adaptive.runtime import AdaptiveScheduler
+    from vllm.distributed.pp_reconfigure.admission import MigrationAdmissionGate
+
+    state, model = scenario()
+    model.save(tmp_path / "profile.json")
+    gate = MigrationAdmissionGate()
+
+    async def rpc(method, *args):
+        if method == "molink_migration_capacity":
+            return {"feasible": False}
+        return gate.update(*args) if args else gate.status()
+
+    control = SimpleNamespace(
+        lock=asyncio.Lock(),
+        version=0,
+        engine=SimpleNamespace(engine_core=SimpleNamespace(call_utility_async=rpc)),
+        reconfigure=AsyncMock(),
+    )
+    runtime = AdaptiveScheduler(control, tmp_path / "profile.json", tmp_path)
+    original = runtime.transition
+
+    def broken_log(phase, **details):
+        if phase in ("RECLAIMING", "RECOVERING"):
+            raise OSError("disk full")
+        original(phase, **details)
+
+    monkeypatch.setattr(runtime, "transition", broken_log)
+    with pytest.raises(OSError, match="disk full"):
+        await runtime.migrate_with_admission(state, {"target": 4})
+    assert not gate.status()["enabled"]
+    assert runtime.admission_state == "NORMAL"

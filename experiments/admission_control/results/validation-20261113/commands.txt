@@ -1,0 +1,24 @@
+Working directory: /workspace/molink-runtime/vllm
+Server: bash experiments/admission_control/serve.sh
+01_gate.sh --out experiments/admission_control/results/validation-20261113 --seconds 5
+02_memory_reclaim.sh --out experiments/admission_control/results/validation-20261113 --seconds 5
+04_failure_recovery.sh --out experiments/admission_control/results/validation-20261113 --seconds 5
+03_auto_migration.sh --out experiments/admission_control/results/validation-20261113 --seconds 20
+05_comparison.sh --out experiments/admission_control/results/validation-20261113 --seconds 30
+All wrappers are in experiments/admission_control/ and were invoked with bash.
+
+Comparison confirmation after CPU tests finished:
+bash experiments/admission_control/05_comparison.sh --out experiments/admission_control/results/validation-20261113/comparison-confirmation --concurrency 16 --seconds 30
+
+Full regression:
+.venv/bin/python -m pytest tests/v1/worker/test_adaptive_pp.py tests/v1/worker/test_pp_reconfigure.py tests/v1/core/test_scheduler.py -q
+
+Final focused regression:
+.venv/bin/python -m pytest tests/v1/worker/test_adaptive_pp.py tests/v1/worker/test_pp_reconfigure.py tests/v1/core/test_scheduler.py -k 'not multimodal and not partial_requests and not mm_input and not fsm_cannot and not ec_connector and not encoder_cache and not free_encoder and not eagle3_mm' -q
+
+Baseline reproduction (separate Python process, no checkout changes):
+import subprocess, pytest
+import vllm.v1.core.sched.scheduler as scheduler
+source = subprocess.check_output(['git', 'show', 'HEAD:vllm/v1/core/sched/scheduler.py'], text=True)
+exec(compile(source, scheduler.__file__, 'exec'), scheduler.__dict__)
+pytest.main(['tests/v1/core/test_scheduler.py::test_schedule_multimodal_requests', 'tests/v1/core/test_scheduler.py::test_abort_request_when_structured_output_fsm_cannot_advance', '-q', '--tb=short'])

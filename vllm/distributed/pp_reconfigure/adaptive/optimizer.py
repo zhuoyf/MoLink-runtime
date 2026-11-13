@@ -16,8 +16,16 @@ class OptimizerConfig:
     stale_seconds: float = 10
     memory_reserve: int = 128 << 20
     security_mode: str = "off"
+    admission_control: bool = True
+    admission_timeout: float = 10
+    admission_poll_interval: float = 0.25
 
     def __post_init__(self):
+        if not all(
+            math.isfinite(x) and 0 < x <= 600
+            for x in (self.admission_timeout, self.admission_poll_interval)
+        ):
+            raise ValueError("invalid admission timeout or poll interval")
         if self.stack_size < 1 or self.memory_reserve < (128 << 20):
             raise ValueError("invalid stack size or memory reserve")
         if not all(
@@ -47,7 +55,7 @@ class PartitionOptimizer:
         direction = "1to0" if target > old else "0to1"
         return f"migration/{direction}/{abs(target - old)}/{bucket(kv_bytes)}"
 
-    def evaluate(self, state, model, boundary, now):
+    def evaluate(self, state, model, boundary, now, *, reclaim=False):
         cfg = self.config
         plan = PlacementPlan(
             boundary,
@@ -118,6 +126,15 @@ class PartitionOptimizer:
                 moving_bytes = (
                     incoming * node.transfer_bytes_per_block * node.used_blocks
                 )
+            if reclaim and boundary != state.boundary:
+                # Only test whether an empty pool could fit; the executor still
+                # requires measured physical capacity before any migration.
+                peak = (
+                    node.non_kv_bytes
+                    + incoming * node.weight_bytes_per_layer
+                    + max(target, node.layers) * node.kv_bytes_per_layer_block * 2
+                    + cfg.memory_reserve
+                )
             if boundary != state.boundary and peak > node.memory_budget:
                 return {
                     "boundary": boundary,
@@ -135,7 +152,7 @@ class PartitionOptimizer:
         )
         # Risk is a proxy for lost service, separate from measured preemptions.
         risk = min(1.0, max(0, projected - capacity + 1) / max(1, projected))
-        if boundary != state.boundary and capacity <= used:
+        if boundary != state.boundary and capacity <= (1 if reclaim else used):
             return {
                 "boundary": boundary,
                 "valid": False,
@@ -200,7 +217,9 @@ class PartitionOptimizer:
             "security_seconds": security_seconds,
         }
 
-    def decide(self, state, model, now):
+    def decide(
+        self, state, model, now, *, reclaim=False, gate_wait=0, queue_seconds=None
+    ):
         result = {
             "state": asdict(state),
             "candidates": [],
@@ -231,7 +250,7 @@ class PartitionOptimizer:
             self.config.stack_size, state.total_layers, self.config.stack_size
         ):
             try:
-                candidate = self.evaluate(state, model, boundary, now)
+                candidate = self.evaluate(state, model, boundary, now, reclaim=reclaim)
             except ValueError as exc:
                 candidate = {"boundary": boundary, "valid": False, "reason": str(exc)}
             result["candidates"].append(candidate)
@@ -258,6 +277,17 @@ class PartitionOptimizer:
                     + pause
                     + max(0, transition - pause) * c["interference"]
                     + c["security_seconds"]
+                    + (
+                        gate_wait
+                        + (
+                            gate_wait * state.waiting
+                            if queue_seconds is None
+                            else queue_seconds
+                        )
+                        / max(1, state.running or state.batch)
+                        if c["boundary"] != state.boundary
+                        else 0
+                    )
                 )
         errors = [
             e.relative_error

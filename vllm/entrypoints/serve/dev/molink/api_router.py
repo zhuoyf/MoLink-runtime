@@ -95,6 +95,45 @@ async def resize_kv(body: ResizeRequest, request: Request):
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@router.get("/migration_capacity")
+async def migration_capacity(boundary: int, request: Request):
+    control = controller(request)
+    if control.lock.locked():
+        raise HTTPException(
+            status_code=409, detail="a reconfiguration is already running"
+        )
+    async with control.lock:
+        try:
+            return await control.engine.engine_core.call_utility_async(
+                "molink_migration_capacity", boundary
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+class AdmissionRequest(BaseModel):
+    action: Literal["open", "close", "renew"]
+    owner: str
+    timeout: float = 10
+
+
+@router.get("/admission")
+async def admission_status(request: Request):
+    return await controller(request).engine.engine_core.call_utility_async(
+        "molink_admission_gate"
+    )
+
+
+@router.post("/admission")
+async def admission_update(body: AdmissionRequest, request: Request):
+    try:
+        return await controller(request).engine.engine_core.call_utility_async(
+            "molink_admission_gate", body.action, body.owner, body.timeout
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 class SimulationRequest(BaseModel):
     stages: list[dict]
     target_boundary: StrictInt | None = None
