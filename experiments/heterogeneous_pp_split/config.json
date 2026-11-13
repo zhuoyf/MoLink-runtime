@@ -1,0 +1,67 @@
+{
+  "model": "/workspace/model/llama7b",
+  "port": 26040,
+  "splits": [
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24
+  ],
+  "warmup_seconds": 30,
+  "measure_seconds": 300,
+  "startup_timeout": 300,
+  "request_timeout": 240,
+  "available_gib": [
+    12,
+    20
+  ],
+  "budget_gib": [
+    11,
+    19
+  ],
+  "contention_duty": [
+    0.7,
+    0
+  ],
+  "workloads": {
+    "A": {
+      "input": 2048,
+      "output": 32,
+      "concurrency": 4
+    },
+    "B": {
+      "input": 128,
+      "output": 1024,
+      "concurrency": 16
+    },
+    "C": {
+      "input": 2048,
+      "output": 512,
+      "concurrency": 12
+    }
+  },
+  "slo": {
+    "ttft_ms": 5000,
+    "tpot_ms": 100
+  },
+  "max_num_seqs": 64,
+  "max_num_batched_tokens": 2048,
+  "sample_seconds": 0.5,
+  "mps_threads_percent": [
+    100,
+    58
+  ]
+}
