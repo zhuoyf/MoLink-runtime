@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "src/bench",
     "src/build-info",
     "src/chat",
     "src/cmd",
@@ -8,7 +7,6 @@ members = [
     "src/llm",
     "src/managed-engine",
     "src/metrics",
-    "src/mock-engine",
     "src/parser",
     "src/parser/python",
     "src/server",
@@ -137,7 +135,6 @@ trait-set = "0.3.0"
 url = "2.5.7"
 uuid = { version = "1.22.0", features = ["v4"] }
 validator = { version = "0.20.0", features = ["derive"] }
-vllm-bench = { path = "src/bench" }
 vllm-build-info = { path = "src/build-info" }
 vllm-chat = { path = "src/chat" }
 vllm-engine-core-client = { path = "src/engine-core-client" }

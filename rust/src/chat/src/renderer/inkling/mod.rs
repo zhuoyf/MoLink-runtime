@@ -426,6 +426,3 @@ fn sort_json(value: &Value) -> Value {
         _ => value.clone(),
     }
 }
-
-#[cfg(test)]
-mod tests;

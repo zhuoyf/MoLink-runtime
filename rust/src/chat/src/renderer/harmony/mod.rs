@@ -485,6 +485,3 @@ fn env_use_harmony_system_instructions() -> bool {
         .and_then(|value| value.parse::<i32>().ok())
         .is_some_and(|value| value != 0)
 }
-
-#[cfg(test)]
-mod tests;

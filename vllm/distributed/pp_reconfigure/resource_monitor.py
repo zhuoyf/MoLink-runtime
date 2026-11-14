@@ -15,7 +15,7 @@ import torch
 
 from vllm.distributed.pp_reconfigure.monitor import write_event
 
-DEFAULT_LOG_DIR = "/workspace/molink-reconfiguration-results/monitoring/resource-sync"
+DEFAULT_LOG_DIR = "runtime/resources"
 FRAME_BYTES = 16384
 
 

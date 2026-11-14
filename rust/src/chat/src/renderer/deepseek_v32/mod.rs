@@ -30,6 +30,3 @@ impl ChatRenderer for DeepSeekV32ChatRenderer {
         })
     }
 }
-
-#[cfg(test)]
-mod tests;

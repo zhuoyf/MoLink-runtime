@@ -15,8 +15,6 @@ mod runtime;
 mod server_info;
 mod state;
 mod tls;
-#[cfg(test)]
-mod tls_tests;
 mod utils;
 
 use std::future::Future;

@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use vllm_managed_engine::ManagedEngineHandle;
 
-use crate::cli::{BenchCommand, Cli, Command};
+use crate::cli::{Cli, Command};
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -85,7 +85,6 @@ fn shutdown_signal() -> CancellationToken {
 fn main() -> ExitCode {
     let process_label =
         match env::args_os().nth(1).as_deref().and_then(OsStr::to_str).unwrap_or_default() {
-            "bench" => "Bench",
             "serve" | "frontend" => "RustFrontend",
             _ => "Rust",
         };
@@ -116,10 +115,6 @@ fn main() -> ExitCode {
 async fn async_main(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Frontend(args) => vllm_server::serve(args.into_config(), shutdown_signal()).await,
-        Command::Bench(BenchCommand::Serve(bench_args)) => {
-            vllm_bench::prepare_process();
-            vllm_bench::run(bench_args).await
-        }
         Command::Serve(args) => {
             let handshake_port = args.managed_engine.resolve_handshake_port()?;
 

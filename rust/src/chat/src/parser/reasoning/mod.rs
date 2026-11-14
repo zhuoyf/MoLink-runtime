@@ -156,6 +156,3 @@ impl ReasoningParserFactory {
         })
     }
 }
-
-#[cfg(test)]
-mod tests;

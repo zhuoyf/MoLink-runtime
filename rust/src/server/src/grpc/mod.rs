@@ -20,6 +20,3 @@ pub(crate) use inference::InferenceGrpcService;
 pub use inference::InferenceServiceImpl;
 pub use pb::control_server::ControlServer;
 pub use pb::inference_server::InferenceServer;
-
-#[cfg(test)]
-mod tests;

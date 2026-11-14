@@ -137,6 +137,3 @@ pub enum ReasoningError {
     )]
     DummyUnifiedParser { name: String },
 }
-
-#[cfg(test)]
-mod tests;

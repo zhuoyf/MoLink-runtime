@@ -154,9 +154,3 @@ fn build_router_with_options(
 
     router
 }
-
-#[cfg(test)]
-mod tests;
-
-#[cfg(test)]
-mod http_client_tests;

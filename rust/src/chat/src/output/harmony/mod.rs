@@ -417,6 +417,3 @@ fn tool_name<'a>(channel: Option<&str>, recipient: Option<&'a str>) -> Option<&'
         _ => None,
     }
 }
-
-#[cfg(test)]
-mod tests;

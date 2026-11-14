@@ -1,9 +1,0 @@
-__pycache__/
-logs/
-pilot/
-results/
-*.pid
-run.lock
-status
-exit_code
-completed

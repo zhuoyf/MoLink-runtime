@@ -11,8 +11,6 @@ mod error;
 mod hf;
 mod incremental;
 mod tekken;
-#[cfg(any(test, feature = "test-utils"))]
-pub mod test_utils;
 mod tiktoken;
 
 pub use error::{Result, TokenizerError};

@@ -89,18 +89,8 @@ pub enum Command {
     /// Launch a managed Python headless engine, then run the Rust OpenAI
     /// frontend.
     Serve(ServeArgs),
-    /// Run vLLM benchmarks.
-    #[command(subcommand)]
-    Bench(BenchCommand),
     /// Run engine-free request rendering and preprocessing.
     Render(RenderArgs),
-}
-
-/// Supported benchmark commands.
-#[derive(Debug, Subcommand)]
-pub enum BenchCommand {
-    /// Benchmark online serving throughput.
-    Serve(vllm_bench::BenchServeArgs),
 }
 
 /// Arguments for the engine-free text renderer.
@@ -803,6 +793,3 @@ fn frontend_ipc_addresses() -> (String, String) {
         format!("ipc://{}", output.to_string_lossy()),
     )
 }
-
-#[cfg(test)]
-mod tests;

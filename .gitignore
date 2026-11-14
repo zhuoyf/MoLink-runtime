@@ -258,3 +258,24 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 # Local pipeline reconfiguration measurements
 /benchmark_results/
 /pp_reconfigure_logs/
+
+# Runtime data and local artifacts
+/runtime/
+/results/
+/logs/
+/experiments/
+/benchmark_results/
+*.log
+*.jsonl
+*.pid
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.onnx
+*.gguf
+.env
+.env.*
+*.pem
+*.key

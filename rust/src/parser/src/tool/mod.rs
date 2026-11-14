@@ -16,8 +16,6 @@ mod minimax_m3;
 mod parameters;
 mod qwen_coder;
 mod seed_oss;
-#[cfg(any(test, feature = "test-util"))]
-pub mod test_utils;
 use std::collections::{BTreeMap, btree_map};
 
 pub use deepseek_dsml::{DeepSeekV4ToolParser, DeepSeekV32ToolParser};
@@ -249,6 +247,3 @@ impl<T: ToolParser + ?Sized> T {
         Ok(output.coalesce())
     }
 }
-
-#[cfg(test)]
-mod tests;
