@@ -413,3 +413,133 @@ fn done_sse_event() -> Event {
     trace!("generate emitting done");
     Event::default().data("[DONE]")
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use futures::{TryStreamExt as _, stream};
+    use vllm_llm::GeneratePromptInfo;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn generate_chunk_stream_captures_late_prompt_info() {
+        let stream = stream::iter(vec![
+            Ok(GenerateOutput {
+                request_id: String::new(),
+                prompt_info: None,
+                token_ids: Vec::new(),
+                logprobs: None,
+                finish_reason: None,
+                cached_token_count: 0,
+                kv_transfer_params: None,
+                ec_transfer_params: None,
+            }),
+            Ok(GenerateOutput {
+                request_id: String::new(),
+                prompt_info: Some(GeneratePromptInfo {
+                    prompt_token_ids: Arc::from([11_u32, 22_u32]),
+                    prompt_logprobs: None,
+                }),
+                token_ids: vec![33],
+                logprobs: None,
+                finish_reason: Some(FinishReason::stop_eos()),
+                cached_token_count: 2,
+                kv_transfer_params: None,
+                ec_transfer_params: None,
+            }),
+        ]);
+
+        let chunks: Vec<_> = generate_chunk_stream(
+            stream,
+            "raw-stream".to_string(),
+            ApiServerOptions {
+                enable_prompt_tokens_details: true,
+                ..Default::default()
+            },
+            ResponseOptions {
+                include_usage: true,
+                include_continuous_usage: true,
+                ..Default::default()
+            },
+        )
+        .try_collect()
+        .await
+        .expect("collect chunks");
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(
+            chunks[0].usage.as_ref().expect("chunk usage").prompt_tokens,
+            2
+        );
+        assert_eq!(
+            chunks[0]
+                .usage
+                .as_ref()
+                .expect("chunk usage")
+                .prompt_tokens_details
+                .as_ref()
+                .map(|details| details.cached_tokens),
+            Some(2)
+        );
+        assert_eq!(
+            chunks[1].usage.as_ref().expect("final usage").prompt_tokens,
+            2
+        );
+        assert_eq!(
+            chunks[1]
+                .usage
+                .as_ref()
+                .expect("final usage")
+                .prompt_tokens_details
+                .as_ref()
+                .map(|details| details.cached_tokens),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn collect_generate_maps_prompt_logprobs_for_single_token_prompt() {
+        let output_without_payload = |prompt_token_ids: Vec<u32>| CollectedGenerateOutput {
+            request_id: "raw-1".to_string(),
+            prompt_logprobs: None,
+            token_ids: vec![3],
+            logprobs: None,
+            finish_reason: FinishReason::stop_eos(),
+            usage: vllm_llm::TokenUsage {
+                prompt_token_count: prompt_token_ids.len(),
+                output_token_count: 1,
+                cached_token_count: 0,
+            },
+            kv_transfer_params: None,
+            ec_transfer_params: None,
+            prompt_token_ids,
+        };
+
+        let response = collect_generate(
+            output_without_payload(vec![9707]),
+            "raw-1".to_string(),
+            ApiServerOptions::default(),
+            ResponseOptions {
+                include_prompt_logprobs: true,
+                ..Default::default()
+            },
+        )
+        .expect("single-token prompt without payload maps to [None]");
+        let prompt_logprobs = response.prompt_logprobs.expect("prompt logprobs present");
+        assert_eq!(prompt_logprobs.len(), 1);
+        assert!(prompt_logprobs[0].is_none());
+
+        collect_generate(
+            output_without_payload(vec![9707, 11]),
+            "raw-2".to_string(),
+            ApiServerOptions::default(),
+            ResponseOptions {
+                include_prompt_logprobs: true,
+                ..Default::default()
+            },
+        )
+        .expect_err("multi-token prompt without payload is an engine failure");
+    }
+}

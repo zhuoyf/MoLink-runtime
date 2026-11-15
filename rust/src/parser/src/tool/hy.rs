@@ -382,3 +382,418 @@ fn parameter(input: &mut &str, markers: &HyToolMarkers) -> ModalResult<(String, 
 fn ignored_rest_event(input: &mut HyInput<'_>) -> ModalResult<HyEvent> {
     rest.value(HyEvent::IgnoredRest).parse_next(input)
 }
+
+#[cfg(test)]
+mod tests {
+    use expect_test::expect;
+    use serde_json::{Value, json};
+    use thiserror_ext::AsReport;
+
+    use super::{HyDialect, HyToolParser, ToolParser};
+    use crate::tool::test_utils::{collect_stream, split_by_chars, test_tools};
+    use crate::tool::{ToolParserOutput, ToolParserTestExt as _};
+
+    fn build_tool_call(function_name: &str, params: &[(&str, &str)]) -> String {
+        let params = params
+            .iter()
+            .map(|(name, value)| format!("<arg_key>{name}</arg_key><arg_value>{value}</arg_value>"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("<tool_call>{function_name}<tool_sep>{params}</tool_call>")
+    }
+
+    fn build_tool_calls(tool_calls: &[String]) -> String {
+        format!("<tool_calls>\n{}\n</tool_calls>", tool_calls.join("\n"))
+    }
+
+    fn parsed_arguments(output: &ToolParserOutput, index: usize) -> Value {
+        serde_json::from_str(&output.calls()[index].arguments).unwrap()
+    }
+
+    #[test]
+    fn hy_v3_does_not_preserve_special_tokens() {
+        let parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+
+        assert!(!parser.preserve_special_tokens());
+    }
+
+    #[test]
+    fn hy_v3_parse_complete_without_tool_call_keeps_text() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+        let output = parser.parse_complete("This is a plain response.").unwrap();
+
+        assert_eq!(output.normal_text(), "This is a plain response.");
+        assert!(output.calls().is_empty());
+    }
+
+    #[test]
+    fn hy_v3_parse_complete_extracts_zero_arg_inline_tool_call() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+        let output = parser
+            .parse_complete(
+                "<tool_calls><tool_call>get_current_date<tool_sep></tool_call></tool_calls>",
+            )
+            .unwrap();
+
+        assert_eq!(output.normal_text(), "");
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_current_date"));
+        assert_eq!(parsed_arguments(&output, 0), json!({}));
+    }
+
+    #[test]
+    fn hy_v3_parse_complete_extracts_zero_arg_newline_tool_call() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+        let output = parser
+            .parse_complete(
+                "<tool_calls>\n<tool_call>get_current_date<tool_sep>\n</tool_call>\n</tool_calls>",
+            )
+            .unwrap();
+
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_current_date"));
+        assert_eq!(parsed_arguments(&output, 0), json!({}));
+    }
+
+    #[test]
+    fn hy_v3_parse_complete_extracts_arguments_on_same_line() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+        let output = parser
+            .parse_complete(
+                "<tool_calls><tool_call>get_weather<tool_sep><arg_key>city</arg_key><arg_value>Beijing</arg_value><arg_key>date</arg_key><arg_value>2026-03-30</arg_value></tool_call></tool_calls>",
+            )
+            .unwrap();
+
+        assert_eq!(
+            parsed_arguments(&output, 0),
+            json!({ "city": "Beijing", "date": "2026-03-30" })
+        );
+    }
+
+    #[test]
+    fn hy_v3_parse_complete_extracts_arguments_with_newlines() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+        let output = parser
+            .parse_complete(&build_tool_calls(&[build_tool_call(
+                "get_weather",
+                &[("city", "Beijing"), ("date", "2026-03-30")],
+            )]))
+            .unwrap();
+
+        assert_eq!(
+            parsed_arguments(&output, 0),
+            json!({ "city": "Beijing", "date": "2026-03-30" })
+        );
+    }
+
+    #[test]
+    fn hy_v3_parse_complete_preserves_prefix_and_ignores_trailing_text() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+        let output = parser
+            .parse_complete(&format!(
+                "Checking.{} trailing text",
+                build_tool_calls(&[build_tool_call("get_current_date", &[])])
+            ))
+            .unwrap();
+
+        assert_eq!(output.normal_text(), "Checking.");
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_current_date"));
+    }
+
+    #[test]
+    fn hy_v3_parse_complete_extracts_multiple_tool_calls_in_one_block() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+        let output = parser
+            .parse_complete(&build_tool_calls(&[
+                build_tool_call(
+                    "get_weather",
+                    &[("city", "Beijing"), ("date", "2026-03-30")],
+                ),
+                build_tool_call(
+                    "get_weather",
+                    &[("city", "Hangzhou"), ("date", "2026-03-30")],
+                ),
+            ]))
+            .unwrap();
+
+        expect![[r#"
+            ToolParserOutput {
+                events: [
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 0,
+                            name: Some(
+                                "get_weather",
+                            ),
+                            arguments: "{\"city\":\"Beijing\",\"date\":\"2026-03-30\"}",
+                        },
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 1,
+                            name: Some(
+                                "get_weather",
+                            ),
+                            arguments: "{\"city\":\"Hangzhou\",\"date\":\"2026-03-30\"}",
+                        },
+                    ),
+                ],
+            }
+        "#]]
+        .assert_debug_eq(&output);
+    }
+
+    #[test]
+    fn hy_v3_parse_complete_converts_schema_types() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+        let output = parser
+            .parse_complete(&build_tool_calls(&[build_tool_call(
+                "convert",
+                &[
+                    ("whole", "5.3"),
+                    ("flag", "true"),
+                    ("payload", r#"{"k":1}"#),
+                    ("items", "[1,2]"),
+                ],
+            )]))
+            .unwrap();
+
+        assert_eq!(
+            parsed_arguments(&output, 0),
+            json!({
+                "whole": 5.3,
+                "flag": true,
+                "payload": { "k": 1 },
+                "items": [1, 2]
+            })
+        );
+    }
+
+    #[test]
+    fn hy_v3_streaming_without_tool_call_emits_text_incrementally() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+        let mut output = ToolParserOutput::default();
+
+        output.append(parser.parse_chunk("This is ").unwrap());
+        output.append(parser.parse_chunk("a plain ").unwrap());
+        output.append(parser.parse_chunk("response.").unwrap());
+        output.append(parser.finish().unwrap());
+
+        assert_eq!(output.normal_text(), "This is a plain response.");
+        assert!(output.calls().is_empty());
+    }
+
+    #[test]
+    fn hy_v3_streaming_extracts_zero_arg_tool_call() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+        let chunks = [
+            "<tool_calls>",
+            "\n<tool_call>",
+            "get_current_date",
+            "<tool_sep>",
+            "\n</tool_call>",
+            "\n</tool_calls>",
+        ];
+
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_current_date"));
+        assert_eq!(parsed_arguments(&output, 0), json!({}));
+    }
+
+    #[test]
+    fn hy_v3_streaming_extracts_arguments() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+        let chunks = [
+            "<tool_calls>",
+            "\n<tool_call>",
+            "get_weather",
+            "<tool_sep>",
+            "\n<arg_key>city</arg_key>",
+            "\n<arg_value>Beijing</arg_value>",
+            "\n<arg_key>date</arg_key>",
+            "\n<arg_value>2026-03-30</arg_value>",
+            "\n</tool_call>",
+            "\n</tool_calls>",
+        ];
+
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            parsed_arguments(&output, 0),
+            json!({ "city": "Beijing", "date": "2026-03-30" })
+        );
+    }
+
+    #[test]
+    fn hy_v3_streaming_preserves_prefix_text() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+        let chunks = [
+            "Checking.",
+            "<tool_calls>",
+            "\n<tool_call>",
+            "get_current_date",
+            "<tool_sep>",
+            "\n</tool_call>",
+            "\n</tool_calls>",
+        ];
+
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(output.normal_text(), "Checking.");
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_current_date"));
+    }
+
+    #[test]
+    fn hy_v3_streaming_extracts_multiple_tool_calls_in_one_block() {
+        let input = build_tool_calls(&[
+            build_tool_call(
+                "get_weather",
+                &[("city", "Beijing"), ("date", "2026-03-30")],
+            ),
+            build_tool_call(
+                "get_weather",
+                &[("city", "Hangzhou"), ("date", "2026-03-30")],
+            ),
+        ]);
+        let chunks = split_by_chars(&input, 9);
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(output.calls().len(), 2);
+        assert_eq!(parsed_arguments(&output, 0)["city"], json!("Beijing"));
+        assert_eq!(parsed_arguments(&output, 1)["city"], json!("Hangzhou"));
+    }
+
+    #[test]
+    fn hy_v3_streaming_handles_start_marker_split_across_chunks() {
+        let input = format!(
+            "hello {}",
+            build_tool_calls(&[build_tool_call("get_weather", &[("city", "Beijing")])])
+        );
+        let chunks = split_by_chars(&input, 5);
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(output.normal_text(), "hello ");
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(parsed_arguments(&output, 0), json!({ "city": "Beijing" }));
+    }
+
+    #[test]
+    fn hy_v3_streaming_does_not_emit_incomplete_tool_call() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+        let mut output = ToolParserOutput::default();
+
+        parser
+            .parse_into(
+                "<tool_calls><tool_call>get_weather<tool_sep><arg_key>city</arg_key><arg_value>Bei",
+                &mut output,
+            )
+            .unwrap();
+
+        assert_eq!(output.normal_text(), "");
+        assert!(output.calls().is_empty());
+    }
+
+    #[test]
+    fn hy_v3_finish_fails_incomplete_tool_call() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+        parser.parse_chunk("<tool_calls><tool_call>get_weather<tool_sep>").unwrap();
+
+        let error = parser.finish().unwrap_err();
+
+        expect!["tool parser parsing failed: incomplete HY3 tool call"]
+            .assert_eq(&error.to_report_string());
+    }
+
+    #[test]
+    fn hy_v3_malformed_tool_call_fails_fast() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V3);
+        let error = parser
+            .parse_complete(
+                "<tool_calls><tool_call>get_weather<tool_sep><arg_key>city</arg_key><arg_value>Beijing</tool_call></tool_calls>",
+            )
+            .unwrap_err();
+
+        assert!(error.to_report_string().starts_with("tool parser parsing failed:"));
+    }
+
+    #[test]
+    fn hy_v4_parse_complete_extracts_compact_calls_with_and_without_arguments() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V4);
+        let output = parser
+            .parse_complete(
+                "<tool_calls><tool_call>get_weather<arg_key>city</arg_key><arg_value>Beijing</arg_value><arg_key>date</arg_key><arg_value>2026-03-30</arg_value></tool_call><tool_call>get_current_date</tool_call></tool_calls>",
+            )
+            .unwrap();
+
+        expect![[r#"
+            ToolParserOutput {
+                events: [
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 0,
+                            name: Some(
+                                "get_weather",
+                            ),
+                            arguments: "{\"city\":\"Beijing\",\"date\":\"2026-03-30\"}",
+                        },
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 1,
+                            name: Some(
+                                "get_current_date",
+                            ),
+                            arguments: "{}",
+                        },
+                    ),
+                ],
+            }
+        "#]]
+        .assert_debug_eq(&output);
+    }
+
+    #[test]
+    fn hy_v4_streaming_handles_markers_split_across_chunks() {
+        let input = "prefix<tool_calls><tool_call>get_weather<arg_key>city</arg_key><arg_value>上海</arg_value></tool_call><tool_call>get_current_date</tool_call></tool_calls>";
+        let chunks = split_by_chars(input, 7);
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V4);
+
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(output.normal_text(), "prefix");
+        assert_eq!(output.calls().len(), 2);
+        assert_eq!(parsed_arguments(&output, 0), json!({ "city": "上海" }));
+        assert_eq!(output.calls()[1].name.as_deref(), Some("get_current_date"));
+        assert_eq!(parsed_arguments(&output, 1), json!({}));
+    }
+
+    #[test]
+    fn hy_v4_finish_reports_its_dialect_for_incomplete_calls() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V4);
+        parser.parse_chunk("<tool_calls><tool_call>get_weather").unwrap();
+
+        let error = parser.finish().unwrap_err();
+
+        expect!["tool parser parsing failed: incomplete HY4 tool call"]
+            .assert_eq(&error.to_report_string());
+    }
+
+    #[test]
+    fn hy_v4_malformed_argument_pair_fails_fast() {
+        let mut parser = HyToolParser::new(&test_tools(), "", HyDialect::V4);
+        let error = parser
+            .parse_complete(
+                "<tool_calls><tool_call>get_weather<arg_key>city</arg_key>Beijing</tool_call></tool_calls>",
+            )
+            .unwrap_err();
+
+        assert!(error.to_report_string().starts_with("tool parser parsing failed:"));
+    }
+}

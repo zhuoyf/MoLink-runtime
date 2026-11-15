@@ -98,3 +98,31 @@ impl fmt::Display for RendererSelection {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr as _;
+
+    use strum::IntoEnumIterator;
+
+    use super::RendererSelection;
+
+    #[test]
+    fn renderer_selection_display_round_trips() {
+        for selection in RendererSelection::iter() {
+            assert_eq!(
+                selection.to_string().parse::<RendererSelection>().unwrap(),
+                selection
+            );
+        }
+    }
+
+    #[test]
+    fn renderer_selection_expected_error_message() {
+        let err = RendererSelection::from_str("unknown").unwrap_err();
+        expect_test::expect![
+            "unknown renderer `unknown` (expected one of: auto, hf, deepseek_v32, deepseek_v4, harmony, inkling, kimi_k3)"
+        ]
+        .assert_eq(&err);
+    }
+}

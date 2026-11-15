@@ -120,3 +120,225 @@ fn validate_function_tools(tools: &[Tool], param: &'static str) -> Result<(), Ap
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+    use vllm_chat::ReasoningEffort;
+
+    use super::validate_request_compat;
+    use crate::routes::openai::chat_completions::types::ChatCompletionRequest;
+    use crate::routes::openai::utils::structured_outputs::ResponseFormat;
+    use crate::routes::openai::utils::types::{
+        ChatMessage, Function, MessageContent, StringOrArray, Tool, ToolChoice, ToolChoiceValue,
+    };
+
+    fn served(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn base_request() -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: Some("Qwen/Qwen1.5-0.5B-Chat".to_string()),
+            messages: vec![ChatMessage::User {
+                content: MessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            stream: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_stop() {
+        let request = ChatCompletionRequest {
+            stop: Some(StringOrArray::String("stop".to_string())),
+            ..base_request()
+        };
+
+        validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
+            .expect("stop strings should be accepted");
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_default_model_inputs() {
+        for model in [None, Some(String::new())] {
+            let request = ChatCompletionRequest {
+                model,
+                ..base_request()
+            };
+            validate_request_compat(&request, &served(&["served-model"]))
+                .expect("default model input should select the primary served model");
+        }
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_non_zero_penalties_and_function_tools() {
+        let request = ChatCompletionRequest {
+            frequency_penalty: Some(0.5),
+            presence_penalty: Some(0.25),
+            min_p: Some(0.2),
+            repetition_penalty: Some(1.1),
+            seed: Some(7),
+            ..base_request()
+        };
+        validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
+            .expect("sampling fields should be accepted");
+
+        let request = ChatCompletionRequest {
+            tools: Some(vec![Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: "tool".to_string(),
+                    description: None,
+                    parameters: json!({}),
+                    strict: None,
+                },
+            }]),
+            ..base_request()
+        };
+        validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
+            .expect("function tools should be accepted");
+
+        let request = ChatCompletionRequest {
+            messages: vec![ChatMessage::Developer {
+                content: MessageContent::Text("policy".to_string()),
+                tools: Some(vec![Tool {
+                    tool_type: "function".to_string(),
+                    function: Function {
+                        name: "tool".to_string(),
+                        description: None,
+                        parameters: json!({}),
+                        strict: None,
+                    },
+                }]),
+                name: None,
+            }],
+            ..base_request()
+        };
+        validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
+            .expect("developer function tools should be accepted");
+    }
+
+    #[test]
+    fn validate_request_compat_rejects_non_function_developer_tools() {
+        let request = ChatCompletionRequest {
+            messages: vec![ChatMessage::Developer {
+                content: MessageContent::Text("policy".to_string()),
+                tools: Some(vec![Tool {
+                    tool_type: "mcp".to_string(),
+                    function: Function {
+                        name: "tool".to_string(),
+                        description: None,
+                        parameters: json!({}),
+                        strict: None,
+                    },
+                }]),
+                name: None,
+            }],
+            ..base_request()
+        };
+
+        assert!(validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_err());
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_output_logprobs() {
+        let request = ChatCompletionRequest {
+            logprobs: true,
+            ..base_request()
+        };
+        validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
+            .expect("logprobs should be accepted");
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_reasoning_effort() {
+        let request = ChatCompletionRequest {
+            reasoning_effort: Some(ReasoningEffort::Max),
+            chat_template_kwargs: Some(HashMap::from([(
+                "reasoning_effort".to_string(),
+                json!("low"),
+            )])),
+            ..base_request()
+        };
+
+        validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
+            .expect("reasoning_effort should be accepted");
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_include_reasoning_false() {
+        let request = ChatCompletionRequest {
+            include_reasoning: false,
+            ..base_request()
+        };
+
+        validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
+            .expect("include_reasoning=false should be accepted");
+    }
+
+    #[test]
+    fn validate_request_compat_rejects_top_logprobs_without_logprobs() {
+        let request = ChatCompletionRequest {
+            top_logprobs: Some(0),
+            ..base_request()
+        };
+        assert!(validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_err());
+    }
+
+    #[test]
+    fn validate_request_compat_rejects_streaming_prompt_logprobs_requests() {
+        let request = ChatCompletionRequest {
+            prompt_logprobs: Some(1),
+            ..base_request()
+        };
+        assert!(validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_err());
+
+        let request = ChatCompletionRequest {
+            prompt_logprobs: Some(-1),
+            ..base_request()
+        };
+        assert!(validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_err());
+    }
+
+    #[test]
+    fn validate_request_compat_rejects_invalid_prompt_logprobs_value() {
+        let request = ChatCompletionRequest {
+            stream: false,
+            prompt_logprobs: Some(-2),
+            ..base_request()
+        };
+        assert!(validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"])).is_err());
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_response_format() {
+        let request = ChatCompletionRequest {
+            response_format: Some(ResponseFormat::Text),
+            ..base_request()
+        };
+        validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
+            .expect("response_format=text should be accepted");
+
+        let request = ChatCompletionRequest {
+            response_format: Some(ResponseFormat::JsonObject),
+            ..base_request()
+        };
+        validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
+            .expect("response_format=json_object should be accepted");
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_noop_tool_choice_none() {
+        let request = ChatCompletionRequest {
+            tool_choice: Some(ToolChoice::Value(ToolChoiceValue::None)),
+            ..base_request()
+        };
+
+        validate_request_compat(&request, &served(&["Qwen/Qwen1.5-0.5B-Chat"]))
+            .expect("tool_choice=none is ok");
+    }
+}

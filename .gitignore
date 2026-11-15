@@ -259,23 +259,5 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 /benchmark_results/
 /pp_reconfigure_logs/
 
-# Runtime data and local artifacts
+# Dynamic PP runtime artifacts
 /runtime/
-/results/
-/logs/
-/experiments/
-/benchmark_results/
-*.log
-*.jsonl
-*.pid
-*.safetensors
-*.pt
-*.pth
-*.ckpt
-*.bin
-*.onnx
-*.gguf
-.env
-.env.*
-*.pem
-*.key

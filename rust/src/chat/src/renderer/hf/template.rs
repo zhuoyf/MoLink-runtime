@@ -130,3 +130,206 @@ impl CompiledChatTemplate {
         self.content_format
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+    use vllm_text::backend::hf::{HfSpecialTokens, NamedSpecialToken};
+
+    use super::*;
+
+    #[test]
+    fn test_chat_template_state_valid_template() {
+        let template = CompiledChatTemplate::new(
+            "{{ messages }}".to_string(),
+            ChatTemplateContentFormatOption::Auto,
+        )
+        .unwrap();
+        assert_eq!(template.content_format(), ChatTemplateContentFormat::String);
+        let result = template.apply(TemplateContext::default()).unwrap();
+        assert_eq!(result, "[]");
+    }
+
+    #[test]
+    fn test_midchain_dotted_integer_lookup() {
+        let template = CompiledChatTemplate::new(
+            "{{ values.0.name }}".to_string(),
+            ChatTemplateContentFormatOption::Auto,
+        )
+        .unwrap();
+        let mut kwargs = HashMap::new();
+        kwargs.insert("values".to_string(), serde_json::json!([{"name": "first"}]));
+
+        let result = template
+            .apply(TemplateContext {
+                template_kwargs: Some(&kwargs),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(result, "first");
+    }
+
+    #[test]
+    fn test_chat_template_state_invalid_template() {
+        let result = CompiledChatTemplate::new(
+            "{% invalid".to_string(),
+            ChatTemplateContentFormatOption::Auto,
+        );
+        assert!(result.is_err());
+        let err = result.err().unwrap().to_string();
+        assert!(
+            err.contains("failed to render jinja template"),
+            "Error should explain parse failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_special_tokens_injected_into_context() {
+        let template = "{{ bos_token }}hello{{ eos_token }}";
+        let template =
+            CompiledChatTemplate::new(template.to_string(), ChatTemplateContentFormatOption::Auto)
+                .unwrap();
+
+        let special_tokens = HfSpecialTokens {
+            bos_token: Some(NamedSpecialToken::Text("<s>".to_string())),
+            eos_token: Some(NamedSpecialToken::Text("</s>".to_string())),
+            ..Default::default()
+        };
+
+        let result = template
+            .apply(TemplateContext {
+                special_tokens: Some(&special_tokens),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(result, "<s>hello</s>");
+    }
+
+    #[test]
+    fn test_special_tokens_undefined_when_not_provided() {
+        let template = "{% if bos_token is defined %}{{ bos_token }}{% endif %}hello";
+        let template =
+            CompiledChatTemplate::new(template.to_string(), ChatTemplateContentFormatOption::Auto)
+                .unwrap();
+
+        let result = template.apply(TemplateContext::default()).unwrap();
+        assert_eq!(result, "hello");
+    }
+
+    #[test]
+    fn test_special_tokens_partial() {
+        let template =
+            "{{ bos_token }}hello{% if eos_token is defined %}{{ eos_token }}{% endif %}";
+        let template =
+            CompiledChatTemplate::new(template.to_string(), ChatTemplateContentFormatOption::Auto)
+                .unwrap();
+
+        let special_tokens = HfSpecialTokens {
+            bos_token: Some(NamedSpecialToken::Text("<s>".to_string())),
+            eos_token: None,
+            ..Default::default()
+        };
+
+        let result = template
+            .apply(TemplateContext {
+                special_tokens: Some(&special_tokens),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(result, "<s>hello");
+    }
+
+    #[test]
+    fn test_tojson_filter_supports_indent_and_sort_keys() {
+        let template = CompiledChatTemplate::new(
+            "{{ payload | tojson(indent=2, sort_keys=true) }}".to_string(),
+            ChatTemplateContentFormatOption::Auto,
+        )
+        .unwrap();
+        let mut kwargs = HashMap::new();
+        kwargs.insert("payload".to_string(), serde_json::json!({"b": 1, "a": 2}));
+
+        let result = template
+            .apply(TemplateContext {
+                template_kwargs: Some(&kwargs),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(result, "{\n  \"a\": 2,\n  \"b\": 1\n}");
+    }
+
+    #[test]
+    fn test_load_chat_template_from_file_jinja() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("chat_template.jinja");
+        fs::write(&path, "{{ messages }}").unwrap();
+
+        let template = load_chat_template(&path).unwrap();
+
+        assert_eq!(template.as_deref(), Some("{{ messages }}"));
+    }
+
+    #[test]
+    fn test_resolve_chat_template_from_inline_literal() {
+        let template = resolve_chat_template("{{ messages }}").unwrap();
+
+        assert_eq!(template, "{{ messages }}");
+    }
+
+    #[test]
+    fn test_resolve_chat_template_from_existing_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("chat_template.jinja");
+        fs::write(&path, "{{ messages }}").unwrap();
+
+        let template = resolve_chat_template(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(template, "{{ messages }}");
+    }
+
+    #[test]
+    fn test_resolve_chat_template_rejects_missing_path_like_value() {
+        let error = resolve_chat_template("missing_template.jinja").unwrap_err();
+
+        assert!(matches!(error, TemplateError::MissingTemplatePath));
+    }
+
+    #[test]
+    fn test_chat_template_state_respects_explicit_content_format_override() {
+        let template = CompiledChatTemplate::new(
+            "{% for item in messages[0].content %}{{ item.text }}{% endfor %}".to_string(),
+            ChatTemplateContentFormatOption::String,
+        )
+        .unwrap();
+
+        assert_eq!(template.content_format(), ChatTemplateContentFormat::String);
+    }
+
+    #[test]
+    fn test_load_chat_template_from_file_json_string() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("chat_template.json");
+        fs::write(&path, "\"{{ messages }}\"").unwrap();
+
+        let template = load_chat_template(&path).unwrap();
+
+        assert_eq!(template.as_deref(), Some("{{ messages }}"));
+    }
+
+    #[test]
+    fn test_load_chat_template_from_file_json_object() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("chat_template.json");
+        fs::write(&path, r#"{"chat_template":"{{ messages }}"}"#).unwrap();
+
+        let template = load_chat_template(&path).unwrap();
+
+        assert_eq!(template.as_deref(), Some("{{ messages }}"));
+    }
+}

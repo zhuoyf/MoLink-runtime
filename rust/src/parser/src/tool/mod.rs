@@ -16,6 +16,8 @@ mod minimax_m3;
 mod parameters;
 mod qwen_coder;
 mod seed_oss;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_utils;
 use std::collections::{BTreeMap, btree_map};
 
 pub use deepseek_dsml::{DeepSeekV4ToolParser, DeepSeekV32ToolParser};
@@ -221,3 +223,32 @@ pub trait ToolParser: Send {
 ///
 /// These helpers do not handle partial parsing or error recovery, so they are
 /// not intended for use in production code paths.
+#[cfg(any(test, feature = "test-util"))]
+#[easy_ext::ext(ToolParserTestExt)]
+impl<T: ToolParser + ?Sized> T {
+    /// Feed one decoded text delta and return only if the whole chunk parses.
+    ///
+    /// If parsing fails, partial committed output is discarded by this helper.
+    /// Prefer `parse_into` for more fine-grained control in error recovery.
+    pub fn parse_chunk(&mut self, chunk: &str) -> Result<ToolParserOutput> {
+        let mut output = ToolParserOutput::default();
+        self.parse_into(chunk, &mut output)?;
+        Ok(output)
+    }
+
+    /// Parse complete tool calls from final output.
+    ///
+    /// This default implementation reuses the incremental parser lifecycle by
+    /// feeding the full output through `parse_chunk()` and then calling `finish()`.
+    ///
+    /// If parsing fails, partial committed output is discarded by this helper.
+    /// Prefer `parse_into` for more fine-grained control in error recovery.
+    pub fn parse_complete(&mut self, text: &str) -> Result<ToolParserOutput> {
+        let mut output = self.parse_chunk(text)?;
+        output.append(self.finish()?);
+        Ok(output.coalesce())
+    }
+}
+
+#[cfg(test)]
+mod tests;

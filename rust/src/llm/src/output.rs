@@ -182,6 +182,29 @@ impl GenerateOutput {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
+impl GenerateOutput {
+    /// Build a [`GenerateOutput`] for tests.
+    pub fn for_test(
+        prompt_token_ids: Option<Arc<[u32]>>,
+        token_ids: Vec<u32>,
+        finish_reason: Option<FinishReason>,
+    ) -> Self {
+        Self {
+            request_id: String::new(),
+            prompt_info: prompt_token_ids.map(|ids| GeneratePromptInfo {
+                prompt_token_ids: ids,
+                prompt_logprobs: None,
+            }),
+            token_ids,
+            logprobs: None,
+            finish_reason,
+            cached_token_count: 0,
+            kv_transfer_params: None,
+            ec_transfer_params: None,
+        }
+    }
+}
 
 /// Stream of per-request generate outputs for one request.
 ///

@@ -202,3 +202,618 @@ fn completion_echo_text(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::http::HeaderMap;
+    use serde_json::json;
+    use validator::Validate;
+    use vllm_text::{Prompt, PromptTruncation, PromptTruncationLimit, TruncationSide};
+    use vllm_tokenizer::test_utils::TestTokenizer;
+
+    use super::prepare_completion_request;
+    use crate::lora::LoraModelResolution;
+    use crate::routes::openai::completions::types::CompletionRequest;
+    use crate::routes::openai::utils::types::Normalizable;
+    use crate::utils::{ResolvedRequestContext, resolve_request_context};
+
+    fn request_context(headers: &HeaderMap, request_id: Option<&str>) -> ResolvedRequestContext {
+        resolve_request_context(headers, request_id)
+    }
+
+    fn served(names: &[&str]) -> LoraModelResolution {
+        LoraModelResolution {
+            model_names: names.iter().map(|s| s.to_string()).collect(),
+            lora_request: None,
+        }
+    }
+
+    fn test_tokenizer() -> TestTokenizer {
+        TestTokenizer::new()
+    }
+
+    fn base_request_json() -> serde_json::Value {
+        json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "stream": true
+        })
+    }
+
+    #[test]
+    fn completion_http_request_deserializes_text_prompt() {
+        let request: CompletionRequest =
+            serde_json::from_value(base_request_json()).expect("parse request");
+
+        assert_eq!(request.prompt, Prompt::Text("hello".to_string()));
+        assert_eq!(request.model.as_deref(), Some("Qwen/Qwen1.5-0.5B-Chat"));
+    }
+
+    #[test]
+    fn completion_http_request_defaults_missing_or_null_model() {
+        for model in [None, Some(serde_json::Value::Null)] {
+            let mut value = base_request_json();
+            let object = value.as_object_mut().expect("request object");
+            match model {
+                Some(model) => {
+                    object.insert("model".to_string(), model);
+                }
+                None => {
+                    object.remove("model");
+                }
+            }
+
+            let request: CompletionRequest =
+                serde_json::from_value(value).expect("parse request without model");
+            assert!(request.model.is_none());
+        }
+
+        let mut value = base_request_json();
+        value
+            .as_object_mut()
+            .expect("request object")
+            .insert("model".to_string(), json!(""));
+        let request: CompletionRequest = serde_json::from_value(value).expect("parse empty model");
+        assert_eq!(request.model.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn completion_http_request_deserializes_token_id_prompt() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": [11, 22, 33],
+            "stream": true,
+            "ignore_eos": true,
+            "max_tokens": 7
+        }))
+        .expect("parse request");
+
+        assert_eq!(request.prompt, Prompt::TokenIds(vec![11, 22, 33]));
+        assert_eq!(request.max_tokens, Some(7));
+        assert!(request.ignore_eos);
+    }
+
+    #[test]
+    fn completion_http_request_rejects_empty_cache_salt() {
+        let mut value = base_request_json();
+        value
+            .as_object_mut()
+            .expect("request object")
+            .insert("cache_salt".to_string(), json!(""));
+        let request: CompletionRequest = serde_json::from_value(value).expect("parse cache_salt");
+
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn prepare_completion_request_normalizes_top_k_sentinels() {
+        for (top_k, expected) in [
+            (serde_json::Value::Null, None),
+            (json!(-1), Some(0)),
+            (json!(0), Some(0)),
+            (json!(20), Some(20)),
+        ] {
+            let mut value = base_request_json();
+            value
+                .as_object_mut()
+                .expect("request object")
+                .insert("top_k".to_string(), top_k);
+            let request: CompletionRequest = serde_json::from_value(value).expect("parse top_k");
+            let prepared = prepare_completion_request(
+                request,
+                &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+                ResolvedRequestContext::default(),
+                &test_tokenizer(),
+            )
+            .expect("prepare top_k");
+
+            assert_eq!(prepared.text_request.sampling_params.top_k, expected);
+        }
+    }
+
+    #[test]
+    fn prepare_completion_request_uses_left_when_side_is_omitted() {
+        let mut value = base_request_json();
+        value
+            .as_object_mut()
+            .expect("request object")
+            .insert("truncate_prompt_tokens".to_string(), json!(-1));
+        let request = serde_json::from_value(value).expect("parse truncation");
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            &test_tokenizer(),
+        )
+        .expect("prepare truncation");
+
+        assert_eq!(
+            prepared.text_request.prompt_truncation,
+            Some(PromptTruncation {
+                limit: PromptTruncationLimit::InputBudget,
+                side: TruncationSide::Left,
+            })
+        );
+    }
+
+    #[test]
+    fn normalize_coerces_null_max_tokens_to_default() {
+        // An absent `max_tokens` already gets the serde default.
+        let absent: CompletionRequest =
+            serde_json::from_value(base_request_json()).expect("parse request");
+        assert_eq!(absent.max_tokens, Some(16));
+
+        // An explicit `null` deserializes to `None`, bypassing the default;
+        // `normalize` must coerce it back to match Python vLLM.
+        let mut request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "stream": true,
+            "max_tokens": null
+        }))
+        .expect("parse request");
+        assert_eq!(request.max_tokens, None);
+
+        request.normalize();
+        assert_eq!(request.max_tokens, Some(16));
+    }
+
+    #[test]
+    fn prepare_completion_request_maps_sampling_fields() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": [11, 22, 33],
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "max_tokens": 7,
+            "logprobs": 2,
+            "top_p": 0.9,
+            "top_k": 42,
+            "min_p": 0.1,
+            "frequency_penalty": 0.2,
+            "presence_penalty": 0.3,
+            "repetition_penalty": 1.1,
+            "ignore_eos": true,
+            "skip_special_tokens": false
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+
+        assert!(prepared.options.include_usage);
+        assert_eq!(
+            prepared.text_request.prompt,
+            Prompt::TokenIds(vec![11, 22, 33])
+        );
+        assert_eq!(prepared.text_request.sampling_params.max_tokens, Some(7));
+        assert_eq!(prepared.text_request.sampling_params.logprobs, Some(2));
+        assert_eq!(prepared.text_request.sampling_params.top_p, Some(0.9));
+        assert_eq!(prepared.text_request.sampling_params.top_k, Some(42));
+        assert_eq!(prepared.text_request.sampling_params.min_p, Some(0.1));
+        assert_eq!(
+            prepared.text_request.sampling_params.frequency_penalty,
+            Some(0.2)
+        );
+        assert_eq!(
+            prepared.text_request.sampling_params.presence_penalty,
+            Some(0.3)
+        );
+        assert_eq!(
+            prepared.text_request.sampling_params.repetition_penalty,
+            Some(1.1)
+        );
+        assert!(prepared.text_request.sampling_params.ignore_eos);
+        assert!(!prepared.text_request.decode_options.skip_special_tokens);
+    }
+
+    #[test]
+    fn prepare_completion_request_passes_through_thinking_token_budget() {
+        let prepare = |budget: serde_json::Value| {
+            let request: CompletionRequest = serde_json::from_value(json!({
+                "model": "Qwen/Qwen1.5-0.5B-Chat",
+                "prompt": "hello",
+                "thinking_token_budget": budget,
+            }))
+            .expect("parse request");
+            prepare_completion_request(
+                request,
+                &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+                ResolvedRequestContext::default(),
+                &test_tokenizer(),
+            )
+            .expect("prepare")
+            .text_request
+            .sampling_params
+            .thinking_token_budget
+        };
+
+        // The convert layer forwards the raw value verbatim (including the `-1`
+        // "unlimited" sentinel); normalization/validation happens during
+        // lowering (see `vllm_text::lower`).
+        assert_eq!(prepare(json!(64)), Some(64));
+        assert_eq!(prepare(json!(-1)), Some(-1));
+        assert_eq!(prepare(json!(null)), None);
+    }
+
+    #[test]
+    fn prepare_completion_request_maps_stream_usage_and_token_format_options() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "stream": true,
+            "stream_options": {
+                "include_usage": true,
+                "continuous_usage_stats": true
+            },
+            "return_tokens_as_token_ids": true
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+
+        assert!(prepared.options.include_usage);
+        assert!(prepared.options.include_continuous_usage);
+        assert!(prepared.options.return_tokens_as_token_ids);
+    }
+
+    #[test]
+    fn prepare_completion_request_gates_continuous_usage_on_include_usage() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "stream": true,
+            "stream_options": {
+                "continuous_usage_stats": true
+            }
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+
+        assert!(!prepared.options.include_usage);
+        assert!(!prepared.options.include_continuous_usage);
+    }
+
+    #[test]
+    fn prepare_completion_request_accepts_text_echo() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "stream": true,
+            "echo": true,
+            "max_tokens": 7
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+
+        assert_eq!(prepared.options.echo, Some("hello".to_string()));
+        assert_eq!(prepared.text_request.sampling_params.max_tokens, Some(7));
+        assert!(!prepared.options.prompt_only);
+    }
+
+    #[test]
+    fn prepare_completion_request_lowers_prompt_only_echo_as_one_internal_token() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "stream": false,
+            "echo": true,
+            "max_tokens": 0
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+
+        assert!(prepared.options.prompt_only);
+        assert_eq!(prepared.options.echo, Some("hello".to_string()));
+        assert_eq!(prepared.text_request.sampling_params.max_tokens, Some(1));
+    }
+
+    #[test]
+    fn prepare_completion_request_enables_prompt_logprobs_for_stream_prompt_only_echo() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "echo": true,
+            "stream": true,
+            "max_tokens": 0,
+            "logprobs": 3
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+
+        assert!(prepared.options.prompt_only);
+        assert_eq!(prepared.text_request.sampling_params.logprobs, Some(3));
+        assert_eq!(
+            prepared.text_request.sampling_params.prompt_logprobs,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn prepare_completion_request_enables_prompt_logprobs_for_non_stream_echo() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "echo": true,
+            "stream": false,
+            "logprobs": 3
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+
+        assert_eq!(prepared.text_request.sampling_params.logprobs, Some(3));
+        assert_eq!(
+            prepared.text_request.sampling_params.prompt_logprobs,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn prepare_completion_request_decodes_token_id_prompt_echo() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": [104, 101, 108, 108, 111],
+            "stream": true,
+            "echo": true
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+
+        assert_eq!(prepared.options.echo, Some("hello".to_string()));
+        assert_eq!(
+            prepared.text_request.prompt,
+            Prompt::TokenIds(vec![104, 101, 108, 108, 111])
+        );
+    }
+
+    #[test]
+    fn prepare_completion_request_accepts_logprobs_fields() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "stream": false,
+            "logprobs": 1,
+            "prompt_logprobs": 2
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+        assert_eq!(prepared.text_request.sampling_params.logprobs, Some(1));
+        assert_eq!(
+            prepared.text_request.sampling_params.prompt_logprobs,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn prepare_completion_request_accepts_full_vocab_logprobs() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "stream": false,
+            "logprobs": -1
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            &test_tokenizer(),
+        )
+        .expect("prepare full-vocabulary logprobs");
+
+        assert_eq!(prepared.text_request.sampling_params.logprobs, Some(-1));
+        assert_eq!(prepared.options.requested_logprobs, Some(-1));
+    }
+
+    #[test]
+    fn prepare_completion_request_threads_data_parallel_rank() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "stream": false,
+        }))
+        .expect("parse request");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-data-parallel-rank", "3".parse().unwrap());
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            request_context(&headers, None),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+        assert_eq!(prepared.text_request.data_parallel_rank, Some(3));
+    }
+
+    #[test]
+    fn prepare_completion_request_threads_body_session_id() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "stream": false,
+            "session_id": "body-session",
+            "vllm_xargs": {"session_id": "xargs-session"},
+        }))
+        .expect("parse request");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Session-ID", "header-session".parse().unwrap());
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            request_context(&headers, None),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+        assert_eq!(
+            prepared.text_request.session_id.as_deref(),
+            Some("body-session")
+        );
+    }
+
+    #[test]
+    fn prepare_completion_request_header_priority_overrides_body() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "priority": 10,
+        }))
+        .expect("parse request");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Vllm-Priority", "-5".parse().unwrap());
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            request_context(&headers, None),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+        assert_eq!(prepared.text_request.priority, -5);
+    }
+
+    #[test]
+    fn prepare_completion_request_uses_vllm_xargs_session_id_fallback() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "stream": false,
+            "vllm_xargs": {"session_id": "xargs-session"},
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+        assert_eq!(
+            prepared.text_request.session_id.as_deref(),
+            Some("xargs-session")
+        );
+    }
+
+    #[test]
+    fn prepare_completion_request_ignores_empty_and_non_string_session_id_values() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "stream": false,
+            "session_id": "",
+            "vllm_xargs": {"session_id": 7},
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+        assert_eq!(prepared.text_request.session_id, None);
+    }
+
+    #[test]
+    fn prepare_completion_request_leaves_data_parallel_rank_none_when_absent() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "stream": false,
+        }))
+        .expect("parse request");
+
+        let prepared = prepare_completion_request(
+            request,
+            &served(&["Qwen/Qwen1.5-0.5B-Chat"]),
+            ResolvedRequestContext::default(),
+            &test_tokenizer(),
+        )
+        .expect("prepare");
+        assert_eq!(prepared.text_request.data_parallel_rank, None);
+    }
+}

@@ -180,3 +180,162 @@ fn build_sampling_hints(
         default_max_tokens: sampling_config.and_then(|config| config.max_new_tokens),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::{
+        GenerationConfig, GenerationConfigMode, HfTokenizerConfig, ModelConfig,
+        build_sampling_hints, resolve_eos_token_ids,
+    };
+    use vllm_tokenizer::Tokenizer;
+
+    struct FakeTokenizer;
+
+    impl Tokenizer for FakeTokenizer {
+        fn encode(
+            &self,
+            _text: &str,
+            _add_special_tokens: bool,
+        ) -> vllm_tokenizer::Result<Vec<u32>> {
+            Ok(vec![])
+        }
+
+        fn encode_ordinary(&self, text: &str) -> vllm_tokenizer::Result<Vec<u32>> {
+            self.encode(text, false)
+        }
+
+        fn decode(
+            &self,
+            _token_ids: &[u32],
+            _skip_special_tokens: bool,
+        ) -> vllm_tokenizer::Result<String> {
+            Ok(String::new())
+        }
+
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            (token == "</s>").then_some(2)
+        }
+
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            (id == 2).then(|| "</s>".to_string())
+        }
+    }
+
+    #[test]
+    fn eos_resolution_uses_model_config_when_tokenizer_has_no_eos() {
+        let tokenizer_config: HfTokenizerConfig = serde_json::from_str("{}").unwrap();
+        let model_config: ModelConfig =
+            serde_json::from_str(r#"{"eos_token_id":[200006,200010]}"#).unwrap();
+        let generation_config: GenerationConfig = serde_json::from_str("{}").unwrap();
+
+        let (primary, extra) = resolve_eos_token_ids(
+            &tokenizer_config,
+            &model_config,
+            &generation_config,
+            &FakeTokenizer,
+        );
+
+        assert_eq!(primary, Some(200006));
+        assert_eq!(extra, BTreeSet::from([200010]));
+    }
+
+    #[test]
+    fn eos_resolution_keeps_tokenizer_eos_primary() {
+        let tokenizer_config: HfTokenizerConfig =
+            serde_json::from_str(r#"{"eos_token":"</s>"}"#).unwrap();
+        let model_config: ModelConfig =
+            serde_json::from_str(r#"{"eos_token_id":[2,200006]}"#).unwrap();
+        let generation_config: GenerationConfig =
+            serde_json::from_str(r#"{"eos_token_id":[2,200010]}"#).unwrap();
+
+        let (primary, extra) = resolve_eos_token_ids(
+            &tokenizer_config,
+            &model_config,
+            &generation_config,
+            &FakeTokenizer,
+        );
+
+        assert_eq!(primary, Some(2));
+        assert_eq!(extra, BTreeSet::from([200006, 200010]));
+    }
+
+    #[test]
+    fn vllm_generation_config_keeps_eos_and_uses_neutral_sampling_defaults() {
+        let generation_config: GenerationConfig = serde_json::from_str(
+            r#"{
+                "eos_token_id": [2, 3],
+                "temperature": 0.6,
+                "top_p": 0.95,
+                "top_k": 20,
+                "min_p": 0.1,
+                "repetition_penalty": 1.1,
+                "max_new_tokens": 4096
+            }"#,
+        )
+        .unwrap();
+        let extra_eos_token_ids = BTreeSet::from([3]);
+
+        let hints = (
+            build_sampling_hints(
+                GenerationConfigMode::Auto,
+                &generation_config,
+                Some(2),
+                extra_eos_token_ids.clone(),
+            ),
+            build_sampling_hints(
+                GenerationConfigMode::Vllm,
+                &generation_config,
+                Some(2),
+                extra_eos_token_ids,
+            ),
+        );
+
+        expect_test::expect![[r#"
+            (
+                SamplingHints {
+                    primary_eos_token_id: Some(
+                        2,
+                    ),
+                    extra_eos_token_ids: {
+                        3,
+                    },
+                    default_temperature: Some(
+                        0.6,
+                    ),
+                    default_top_p: Some(
+                        0.95,
+                    ),
+                    default_top_k: Some(
+                        20,
+                    ),
+                    default_min_p: Some(
+                        0.1,
+                    ),
+                    default_repetition_penalty: Some(
+                        1.1,
+                    ),
+                    default_max_tokens: Some(
+                        4096,
+                    ),
+                },
+                SamplingHints {
+                    primary_eos_token_id: Some(
+                        2,
+                    ),
+                    extra_eos_token_ids: {
+                        3,
+                    },
+                    default_temperature: None,
+                    default_top_p: None,
+                    default_top_k: None,
+                    default_min_p: None,
+                    default_repetition_penalty: None,
+                    default_max_tokens: None,
+                },
+            )
+        "#]]
+        .assert_debug_eq(&hints);
+    }
+}

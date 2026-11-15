@@ -90,3 +90,150 @@ pub(super) fn validate_request_compat(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::validate_request_compat;
+    use crate::routes::openai::completions::types::CompletionRequest;
+
+    fn base_request() -> CompletionRequest {
+        serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": "hello",
+            "stream": true,
+        }))
+        .expect("parse request")
+    }
+
+    fn served_names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_logprobs() {
+        let request = CompletionRequest {
+            logprobs: Some(1),
+            ..base_request()
+        };
+        assert!(
+            validate_request_compat(&request, &served_names(&["Qwen/Qwen1.5-0.5B-Chat"])).is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_full_vocab_logprobs() {
+        let request = CompletionRequest {
+            logprobs: Some(-1),
+            ..base_request()
+        };
+        assert!(
+            validate_request_compat(&request, &served_names(&["Qwen/Qwen1.5-0.5B-Chat"])).is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_request_compat_rejects_other_negative_logprobs() {
+        let request = CompletionRequest {
+            logprobs: Some(-2),
+            ..base_request()
+        };
+        assert!(
+            validate_request_compat(&request, &served_names(&["Qwen/Qwen1.5-0.5B-Chat"])).is_err()
+        );
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_any_served_name() {
+        let request = base_request();
+        assert!(
+            validate_request_compat(
+                &request,
+                &served_names(&["other-alias", "Qwen/Qwen1.5-0.5B-Chat"])
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_default_model_inputs() {
+        for model in [None, Some(String::new())] {
+            let request = CompletionRequest {
+                model,
+                ..base_request()
+            };
+            assert!(validate_request_compat(&request, &served_names(&["served-model"])).is_ok());
+        }
+    }
+
+    #[test]
+    fn validate_request_compat_rejects_unknown_model() {
+        let request = base_request();
+        assert!(validate_request_compat(&request, &served_names(&["other-model"])).is_err());
+    }
+
+    #[test]
+    fn validate_request_compat_rejects_streaming_prompt_logprobs() {
+        let request = CompletionRequest {
+            prompt_logprobs: Some(1),
+            ..base_request()
+        };
+        assert!(
+            validate_request_compat(&request, &served_names(&["Qwen/Qwen1.5-0.5B-Chat"])).is_err()
+        );
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_non_stream_prompt_logprobs() {
+        let request = CompletionRequest {
+            stream: false,
+            prompt_logprobs: Some(-1),
+            ..base_request()
+        };
+        assert!(
+            validate_request_compat(&request, &served_names(&["Qwen/Qwen1.5-0.5B-Chat"])).is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_prompt_only_echo() {
+        let request = CompletionRequest {
+            stream: false,
+            echo: true,
+            max_tokens: Some(0),
+            ..base_request()
+        };
+        assert!(
+            validate_request_compat(&request, &served_names(&["Qwen/Qwen1.5-0.5B-Chat"])).is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_request_compat_accepts_token_id_prompt_echo() {
+        let request: CompletionRequest = serde_json::from_value(json!({
+            "model": "Qwen/Qwen1.5-0.5B-Chat",
+            "prompt": [104, 101, 108, 108, 111],
+            "stream": true,
+            "echo": true,
+        }))
+        .expect("parse request");
+
+        assert!(
+            validate_request_compat(&request, &served_names(&["Qwen/Qwen1.5-0.5B-Chat"])).is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_request_compat_rejects_prompt_only_without_echo() {
+        let request = CompletionRequest {
+            stream: false,
+            echo: false,
+            max_tokens: Some(0),
+            ..base_request()
+        };
+        assert!(
+            validate_request_compat(&request, &served_names(&["Qwen/Qwen1.5-0.5B-Chat"])).is_err()
+        );
+    }
+}

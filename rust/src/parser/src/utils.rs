@@ -416,3 +416,447 @@ pub fn parse_buffered_event<E>(
 pub fn incomplete<T>() -> ModalResult<T> {
     Err(ErrMode::Incomplete(Needed::Unknown))
 }
+
+#[cfg(test)]
+mod tests {
+
+    use expect_test::expect;
+    use winnow::Parser;
+    use winnow::error::ErrMode;
+    use winnow::stream::{Offset, Partial, Stream};
+
+    use super::{
+        JsonObjectScanState, JsonStringScanState, MarkerScanState, json_str, parse_buffered_event,
+        partial_prefix_len, safe_text_len, safe_text_len_mul, take_json_object, take_json_string,
+        take_until_marker,
+    };
+
+    #[test]
+    fn partial_prefix_len_handles_ascii_markers() {
+        assert_eq!(
+            partial_prefix_len("hello<|tool", "<|tool_call>"),
+            "<|tool".len()
+        );
+        assert_eq!(partial_prefix_len("hello world", "<|tool_call>"), 0);
+    }
+
+    #[test]
+    fn partial_prefix_len_prefers_longest_overlapping_prefix() {
+        assert_eq!(partial_prefix_len("chunk ending in aba", "ababa"), 3);
+    }
+
+    #[test]
+    fn partial_prefix_len_handles_unicode_markers() {
+        let token = "<｜DSML｜function_calls>";
+        assert_eq!(
+            partial_prefix_len("prefix <｜DSML｜fun", token),
+            "<｜DSML｜fun".len()
+        );
+        assert_eq!(partial_prefix_len("prefix <｜DSML", token), "<｜DSML".len());
+    }
+
+    #[test]
+    fn safe_text_len_stops_before_marker() {
+        let mut input = Partial::new("hello<tool_call>");
+        let checkpoint = input.checkpoint();
+
+        let len = safe_text_len(&mut input, "<tool_call>").unwrap();
+
+        assert_eq!(len, "hello".len());
+        assert_eq!(input.offset_from(&checkpoint), "hello".len());
+    }
+
+    #[test]
+    fn safe_text_len_holds_back_partial_marker() {
+        let mut input = Partial::new("hello<tool");
+        let checkpoint = input.checkpoint();
+
+        let len = safe_text_len(&mut input, "<tool_call>").unwrap();
+
+        assert_eq!(len, "hello".len());
+        assert_eq!(input.offset_from(&checkpoint), "hello".len());
+    }
+
+    #[test]
+    fn safe_text_len_reports_incomplete_for_only_partial_marker() {
+        let mut input = Partial::new("<tool");
+
+        let error = safe_text_len(&mut input, "<tool_call>").unwrap_err();
+
+        assert!(matches!(error, ErrMode::Incomplete(_)));
+    }
+
+    #[test]
+    fn safe_text_len_mul_stops_before_earliest_marker() {
+        let mut input = Partial::new("hello<channel|><|tool_call>");
+        let checkpoint = input.checkpoint();
+
+        let len = safe_text_len_mul(&mut input, &["<|tool_call>", "<channel|>"]).unwrap();
+
+        assert_eq!(len, "hello".len());
+        assert_eq!(input.offset_from(&checkpoint), "hello".len());
+        assert_eq!(*input, "<channel|><|tool_call>");
+    }
+
+    #[test]
+    fn safe_text_len_mul_holds_back_longest_partial_marker() {
+        let mut input = Partial::new("hello<|tool");
+        let checkpoint = input.checkpoint();
+
+        let len = safe_text_len_mul(&mut input, &["<|tool_call>", "<|channel>thought\n"]).unwrap();
+
+        assert_eq!(len, "hello".len());
+        assert_eq!(input.offset_from(&checkpoint), "hello".len());
+        assert_eq!(*input, "<|tool");
+    }
+
+    #[test]
+    fn safe_text_len_mul_skips_false_same_prefix_candidate() {
+        let mut input = Partial::new("hello<not_marker><|tool_call>");
+        let checkpoint = input.checkpoint();
+
+        let len = safe_text_len_mul(&mut input, &["<|tool_call>", "<|channel>thought\n"]).unwrap();
+
+        assert_eq!(len, "hello<not_marker>".len());
+        assert_eq!(input.offset_from(&checkpoint), "hello<not_marker>".len());
+        assert_eq!(*input, "<|tool_call>");
+    }
+
+    #[test]
+    fn safe_text_len_mul_reports_incomplete_for_only_partial_marker() {
+        let mut input = Partial::new("<|channel>thought");
+
+        let error =
+            safe_text_len_mul(&mut input, &["<|tool_call>", "<|channel>thought\n"]).unwrap_err();
+
+        assert!(matches!(error, ErrMode::Incomplete(_)));
+    }
+
+    #[test]
+    fn take_until_marker_stops_before_marker() {
+        let mut state = MarkerScanState::default();
+        let mut input = Partial::new("body</end>tail");
+        let checkpoint = input.checkpoint();
+
+        let body = take_until_marker("</end>", &mut state).parse_next(&mut input).unwrap();
+
+        assert_eq!(body, "body");
+        assert_eq!(input.offset_from(&checkpoint), "body".len());
+        assert_eq!(*input, "</end>tail");
+        assert_eq!(state, MarkerScanState::default());
+    }
+
+    #[test]
+    fn take_until_marker_resumes_after_split_marker() {
+        let mut state = MarkerScanState::default();
+        let mut input = Partial::new("body</to");
+
+        let error = take_until_marker("</tool_call>", &mut state)
+            .parse_next(&mut input)
+            .unwrap_err();
+
+        assert!(matches!(error, ErrMode::Incomplete(_)));
+        assert_eq!(state.scan_start, "body".len());
+
+        let mut input = Partial::new("body</tool_call>tail");
+        let body = take_until_marker("</tool_call>", &mut state).parse_next(&mut input).unwrap();
+
+        assert_eq!(body, "body");
+        assert_eq!(*input, "</tool_call>tail");
+        assert_eq!(state, MarkerScanState::default());
+    }
+
+    #[test]
+    fn take_until_marker_advances_checkpoint_for_long_prefix() {
+        let mut state = MarkerScanState::default();
+        let text = format!("{}{}", "x".repeat(1024), "</too");
+        let mut input = Partial::new(text.as_str());
+
+        let error = take_until_marker("</tool_call>", &mut state)
+            .parse_next(&mut input)
+            .unwrap_err();
+
+        assert!(matches!(error, ErrMode::Incomplete(_)));
+        assert_eq!(state.scan_start, 1024);
+    }
+
+    #[test]
+    fn take_until_marker_keeps_unicode_marker_boundaries() {
+        let marker = "<｜DSML｜function_calls>";
+        let mut state = MarkerScanState::default();
+        let mut input = Partial::new("prefix <｜DSML｜fun");
+
+        let error = take_until_marker(marker, &mut state).parse_next(&mut input).unwrap_err();
+
+        assert!(matches!(error, ErrMode::Incomplete(_)));
+        assert_eq!(state.scan_start, "prefix ".len());
+        assert!("prefix <｜DSML｜fun".is_char_boundary(state.scan_start));
+
+        let mut input = Partial::new("prefix <｜DSML｜function_calls>tail");
+        let body = take_until_marker(marker, &mut state).parse_next(&mut input).unwrap();
+
+        assert_eq!(body, "prefix ");
+        assert_eq!(*input, "<｜DSML｜function_calls>tail");
+        assert_eq!(state, MarkerScanState::default());
+    }
+
+    #[test]
+    fn take_until_marker_floors_stale_checkpoint_to_char_boundary() {
+        let mut state = MarkerScanState { scan_start: 1 };
+        let mut input = Partial::new("é</end>");
+
+        let body = take_until_marker("</end>", &mut state).parse_next(&mut input).unwrap();
+
+        assert_eq!(body, "é");
+        assert_eq!(*input, "</end>");
+        assert_eq!(state, MarkerScanState::default());
+    }
+
+    #[test]
+    fn take_until_marker_handles_overlapping_prefixes() {
+        let mut state = MarkerScanState::default();
+        let mut input = Partial::new("xxaba");
+
+        let error = take_until_marker("ababa", &mut state).parse_next(&mut input).unwrap_err();
+
+        assert!(matches!(error, ErrMode::Incomplete(_)));
+        assert_eq!(state.scan_start, 2);
+
+        let mut input = Partial::new("xxababa!");
+        let body = take_until_marker("ababa", &mut state).parse_next(&mut input).unwrap();
+
+        assert_eq!(body, "xx");
+        assert_eq!(*input, "ababa!");
+    }
+
+    #[test]
+    fn take_json_object_consumes_simple_object() {
+        let mut state = JsonObjectScanState::default();
+        let buffer = r#"{"location":"Paris"}<end>"#;
+        let mut input = Partial::new(buffer);
+        let checkpoint = input.checkpoint();
+
+        let len = take_json_object(&mut input, &mut state).unwrap();
+
+        assert_eq!(len, r#"{"location":"Paris"}"#.len());
+        assert_eq!(input.offset_from(&checkpoint), len);
+        assert!(state.complete());
+    }
+
+    #[test]
+    fn take_json_object_tracks_nested_values_and_strings() {
+        let mut state = JsonObjectScanState::default();
+        let arguments = r#"{"nested":{"items":[{"text":"} <|tool_call_end|> \" \\"}]}}"#;
+        let buffer = format!("{arguments}<end>");
+        let mut input = Partial::new(buffer.as_str());
+
+        let len = take_json_object(&mut input, &mut state).unwrap();
+
+        assert_eq!(len, arguments.len());
+        assert!(state.complete());
+    }
+
+    #[test]
+    fn take_json_object_rejects_leading_whitespace() {
+        let mut state = JsonObjectScanState::default();
+        let mut input = Partial::new(" {\"x\":1}");
+
+        let error = take_json_object(&mut input, &mut state).unwrap_err();
+
+        let ErrMode::Cut(error) = error else {
+            panic!("expected cut error");
+        };
+        expect![[r#"
+            invalid JSON object argument
+            expected `{`"#]]
+        .assert_eq(&error.to_string());
+    }
+
+    #[test]
+    fn take_json_object_leaves_trailing_whitespace_to_caller() {
+        let mut state = JsonObjectScanState::default();
+        let mut input = Partial::new("{\"x\":1}\n<end>");
+        let checkpoint = input.checkpoint();
+
+        let len = take_json_object(&mut input, &mut state).unwrap();
+
+        assert_eq!(len, "{\"x\":1}".len());
+        assert_eq!(input.offset_from(&checkpoint), len);
+        assert!(state.complete());
+    }
+
+    #[test]
+    fn take_json_object_continues_across_chunks() {
+        let mut state = JsonObjectScanState::default();
+        let chunks = [
+            r#"{"text":"literal "#,
+            r#"<|tool_call_end|>"#,
+            r#" inside"}<end>"#,
+        ];
+        let mut collected = String::new();
+
+        for chunk in chunks {
+            let mut input = Partial::new(chunk);
+            let len = take_json_object(&mut input, &mut state).unwrap();
+            collected.push_str(&chunk[..len]);
+        }
+
+        assert_eq!(collected, r#"{"text":"literal <|tool_call_end|> inside"}"#);
+        assert!(state.complete());
+    }
+
+    #[test]
+    fn take_json_object_rejects_non_object_top_level() {
+        let mut state = JsonObjectScanState::default();
+        let mut input = Partial::new(r#"[{"x":1}]"#);
+
+        let error = take_json_object(&mut input, &mut state).unwrap_err();
+
+        let ErrMode::Cut(error) = error else {
+            panic!("expected cut error");
+        };
+        expect![[r#"
+            invalid JSON object argument
+            expected `{`"#]]
+        .assert_eq(&error.to_string());
+    }
+
+    #[test]
+    fn take_json_object_reports_unbalanced_array() {
+        let mut state = JsonObjectScanState::default();
+        let mut input = Partial::new(r#"{"x":]}"#);
+
+        let error = take_json_object(&mut input, &mut state).unwrap_err();
+
+        let ErrMode::Cut(error) = error else {
+            panic!("expected cut error");
+        };
+        expect![[r#"
+            invalid JSON object argument
+            expected balanced array brackets"#]]
+        .assert_eq(&error.to_string());
+    }
+
+    #[test]
+    fn take_json_object_reports_top_level_close_before_nested_array() {
+        let mut state = JsonObjectScanState::default();
+        let mut input = Partial::new(r#"{"x":[}"#);
+
+        let error = take_json_object(&mut input, &mut state).unwrap_err();
+
+        let ErrMode::Cut(error) = error else {
+            panic!("expected cut error");
+        };
+        expect![[r#"
+            invalid JSON object argument
+            expected nested arrays to close before the top-level object"#]]
+        .assert_eq(&error.to_string());
+    }
+
+    #[test]
+    fn take_json_string_consumes_complete_string() {
+        let mut state = JsonStringScanState::default();
+        let mut input = Partial::new(r#""say_\"hi\u0021" rest"#);
+        let checkpoint = input.checkpoint();
+
+        let len = take_json_string(&mut input, &mut state).unwrap();
+
+        assert_eq!(len, r#""say_\"hi\u0021""#.len());
+        assert_eq!(input.offset_from(&checkpoint), len);
+        assert_eq!(*input, " rest");
+    }
+
+    #[test]
+    fn take_json_string_resumes_after_incomplete_input() {
+        let mut state = JsonStringScanState::default();
+        let mut input = Partial::new(r#""{\"data\":\"partial"#);
+        let checkpoint = input.checkpoint();
+
+        let error = take_json_string(&mut input, &mut state).unwrap_err();
+
+        assert!(matches!(error, ErrMode::Incomplete(_)));
+        assert_eq!(input.offset_from(&checkpoint), 0);
+        assert_eq!(state.scanned_len, r#""{\"data\":\"partial"#.len());
+
+        let mut input = Partial::new(r#""{\"data\":\"partial string\"}" tail"#);
+        let len = take_json_string(&mut input, &mut state).unwrap();
+
+        assert_eq!(len, r#""{\"data\":\"partial string\"}""#.len());
+        assert_eq!(*input, " tail");
+    }
+
+    #[test]
+    fn take_json_string_tracks_escape_across_chunks() {
+        let mut state = JsonStringScanState::default();
+        let mut input = Partial::new(r#""abc\"#);
+
+        let error = take_json_string(&mut input, &mut state).unwrap_err();
+
+        assert!(matches!(error, ErrMode::Incomplete(_)));
+        assert!(state.escape);
+
+        let mut input = Partial::new(r#""abc\"def" tail"#);
+        let len = take_json_string(&mut input, &mut state).unwrap();
+
+        assert_eq!(len, r#""abc\"def""#.len());
+        assert_eq!(*input, " tail");
+    }
+
+    #[test]
+    fn take_json_string_rejects_non_string_start() {
+        let mut state = JsonStringScanState::default();
+        let mut input = Partial::new("42");
+
+        let error = take_json_string(&mut input, &mut state).unwrap_err();
+
+        let ErrMode::Cut(error) = error else {
+            panic!("expected cut error");
+        };
+        expect![[r#"
+            invalid JSON string
+            expected `"`"#]]
+        .assert_eq(&error.to_string());
+    }
+
+    #[test]
+    fn json_str_decodes_escaped_content() {
+        let mut input = Partial::new(r#""say_\"hi\u0021" rest"#);
+
+        let value = json_str(&mut input).unwrap();
+
+        assert_eq!(value, "say_\"hi!");
+        assert_eq!(*input, " rest");
+    }
+
+    #[test]
+    fn json_str_reports_incomplete_escaped_string() {
+        let mut input = Partial::new(r#""say_\"#);
+
+        let error = json_str(&mut input).unwrap_err();
+
+        assert!(matches!(error, ErrMode::Incomplete(_)));
+    }
+
+    #[test]
+    fn parse_buffered_event_error_includes_input_snippet() {
+        let result = parse_buffered_event(" {\"x\":1}", |input| {
+            take_json_object(input, &mut JsonObjectScanState::default())
+        });
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("near \""), "error must include snippet");
+    }
+
+    #[test]
+    fn parse_buffered_event_error_truncates_long_input() {
+        let long_input = format!(" {}", "x".repeat(100));
+        let result = parse_buffered_event(&long_input, |input| {
+            take_json_object(input, &mut JsonObjectScanState::default())
+        });
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("near \""), "error must include snippet");
+        assert!(
+            !err.contains(&long_input),
+            "snippet must be truncated for long input"
+        );
+    }
+}

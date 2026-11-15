@@ -236,3 +236,73 @@ impl<'de> Deserialize<'de> for StructuredOutputsParams {
             .map_err(serde::de::Error::custom)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_outputs_backend_ignores_deserialized_value() {
+        let params: StructuredOutputsParams = serde_json::from_value(serde_json::json!({
+            "json_object": true,
+            "_backend": "xgrammar",
+        }))
+        .unwrap();
+
+        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
+        assert_eq!(params.constraint, StructuredOutputConstraint::JsonObject);
+
+        let value = serde_json::to_value(params).unwrap();
+        assert_eq!(value["_backend"], "guidance");
+    }
+
+    #[test]
+    fn structured_outputs_rejects_missing_constraint() {
+        let error =
+            serde_json::from_value::<StructuredOutputsParams>(serde_json::json!({})).unwrap_err();
+
+        assert!(error.to_string().contains("missing structured output constraint"));
+    }
+
+    #[test]
+    fn structured_outputs_rejects_multiple_constraints() {
+        let error = serde_json::from_value::<StructuredOutputsParams>(serde_json::json!({
+            "json": {"type": "object"},
+            "regex": ".*",
+        }))
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("multiple structured output constraints specified: json, regex")
+        );
+    }
+
+    #[test]
+    fn structured_outputs_rejects_json_object_false() {
+        let error = serde_json::from_value::<StructuredOutputsParams>(serde_json::json!({
+            "json_object": false,
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("json_object must be true"));
+    }
+
+    #[test]
+    fn structured_outputs_serializes_through_raw_shape() {
+        let params = StructuredOutputsParams {
+            constraint: StructuredOutputConstraint::StructuralTag(
+                r#"{"type":"structural_tag"}"#.to_string(),
+            ),
+            options: StructuredOutputOptions::default(),
+            backend: StructuredOutputBackend::Xgrammar,
+        };
+
+        let value = serde_json::to_value(params).unwrap();
+
+        assert_eq!(value["structural_tag"], r#"{"type":"structural_tag"}"#);
+        assert_eq!(value["_backend"], "xgrammar");
+        assert!(value.get("json").is_none());
+    }
+}

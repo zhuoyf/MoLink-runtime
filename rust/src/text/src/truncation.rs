@@ -72,3 +72,107 @@ impl PromptTruncation {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_wire_limits() {
+        assert_eq!(
+            PromptTruncation::from_wire(-1, TruncationSide::Left).unwrap(),
+            PromptTruncation {
+                limit: PromptTruncationLimit::InputBudget,
+                side: TruncationSide::Left,
+            }
+        );
+        assert_eq!(
+            PromptTruncation::from_wire(0, TruncationSide::Right).unwrap(),
+            PromptTruncation {
+                limit: PromptTruncationLimit::Fixed(0),
+                side: TruncationSide::Right,
+            }
+        );
+        assert!(matches!(
+            PromptTruncation::from_wire(-2, TruncationSide::Left),
+            Err(Error::InvalidTruncatePromptTokens { value: -2 })
+        ));
+    }
+
+    #[test]
+    fn applies_fixed_limit_from_either_side() {
+        let mut left = vec![1, 2, 3, 4, 5];
+        PromptTruncation {
+            limit: PromptTruncationLimit::Fixed(3),
+            side: TruncationSide::Left,
+        }
+        .apply(&mut left, 90)
+        .unwrap();
+        assert_eq!(left, vec![3, 4, 5]);
+
+        let mut right = vec![1, 2, 3, 4, 5];
+        PromptTruncation {
+            limit: PromptTruncationLimit::Fixed(3),
+            side: TruncationSide::Right,
+        }
+        .apply(&mut right, 90)
+        .unwrap();
+        assert_eq!(right, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn input_budget_reserves_output_tokens() {
+        let mut prompt = vec![0; 100];
+        PromptTruncation {
+            limit: PromptTruncationLimit::InputBudget,
+            side: TruncationSide::Left,
+        }
+        .apply(&mut prompt, 70)
+        .unwrap();
+        assert_eq!(prompt.len(), 70);
+    }
+
+    #[test]
+    fn fixed_limit_cannot_exceed_input_budget() {
+        let mut prompt = vec![1, 2, 3];
+        let error = PromptTruncation {
+            limit: PromptTruncationLimit::Fixed(80),
+            side: TruncationSide::Left,
+        }
+        .apply(&mut prompt, 70)
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::TruncatePromptTokensExceedsBudget {
+                value: 80,
+                budget: 70
+            }
+        ));
+    }
+
+    #[test]
+    fn zero_limit_clears_prompt() {
+        let mut prompt = vec![1, 2, 3];
+        PromptTruncation {
+            limit: PromptTruncationLimit::Fixed(0),
+            side: TruncationSide::Left,
+        }
+        .apply(&mut prompt, 90)
+        .unwrap();
+        assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn limit_at_or_above_prompt_length_is_a_noop() {
+        for limit in [3, 10] {
+            let mut prompt = vec![1, 2, 3];
+            PromptTruncation {
+                limit: PromptTruncationLimit::Fixed(limit),
+                side: TruncationSide::Left,
+            }
+            .apply(&mut prompt, 90)
+            .unwrap();
+            assert_eq!(prompt, vec![1, 2, 3]);
+        }
+    }
+}

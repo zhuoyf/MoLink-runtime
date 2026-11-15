@@ -536,3 +536,541 @@ fn detect_bpe_pattern(config: &TiktokenModelConfig) -> &'static str {
         _ => CL100K_BASE_PATTERN,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    use base64::Engine as _;
+    use tempfile::TempDir;
+
+    use super::{
+        CL100K_BASE_PATTERN, KIMI_PATTERN, TiktokenModelConfig, TiktokenTokenizer,
+        TiktokenTokenizerConfig, detect_bpe_pattern,
+    };
+    use crate::Tokenizer;
+
+    macro_rules! config_json {
+        ($($json:tt)+) => {
+            serde_json::from_value::<TiktokenModelConfig>(serde_json::json!($($json)+)).unwrap()
+        };
+    }
+
+    /// Write a minimal `*.tiktoken` BPE file (one token per byte 0..=255) into
+    /// `dir` and return its path. The single-byte vocab is enough to
+    /// exercise the multi-byte / streaming UTF-8 paths without depending on
+    /// any pretrained tokenizer asset.
+    fn write_synthetic_bpe_file(dir: &std::path::Path) -> PathBuf {
+        let mut content = String::new();
+        for byte in 0u8..=255 {
+            let b64 = base64::engine::general_purpose::STANDARD.encode([byte]);
+            content.push_str(&format!("{b64} {}\n", byte as u32));
+        }
+        let path = dir.join("test.tiktoken");
+        fs::write(&path, content).expect("write tiktoken file");
+        path
+    }
+
+    /// Write a synthetic `*.tiktoken` file whose base-vocab ranks are
+    /// sparse/non-contiguous.
+    ///
+    /// This reproduces the important edge case for `num_base_tokens`: it must
+    /// be derived from `max_rank + 1`, not `encoder.len()`, otherwise
+    /// high-rank base tokens get misclassified as reserved/special ids.
+    fn write_sparse_rank_bpe_file(dir: &std::path::Path) -> PathBuf {
+        let mut content = String::new();
+        for byte in 0u8..=255 {
+            let b64 = base64::engine::general_purpose::STANDARD.encode([byte]);
+            content.push_str(&format!("{b64} {}\n", byte as u32));
+        }
+
+        let high_rank_token = base64::engine::general_purpose::STANDARD.encode(b"SPARSE");
+        content.push_str(&format!("{high_rank_token} 1000\n"));
+
+        let path = dir.join("sparse-rank.tiktoken");
+        fs::write(&path, content).expect("write sparse-rank tiktoken file");
+        path
+    }
+
+    /// Build a `TiktokenTokenizer` from the synthetic BPE file with no sibling
+    /// config files, so the constructor takes the
+    /// `FALLBACK_NUM_RESERVED_SPECIAL_TOKENS` (256) path.
+    fn explicit_backends(path: &Path) -> Vec<TiktokenTokenizer> {
+        vec![
+            TiktokenTokenizer::new_riptoken(path).expect("load riptoken backend"),
+            TiktokenTokenizer::new_tiktoken_rs(path).expect("load tiktoken-rs backend"),
+        ]
+    }
+
+    fn tiktoken_backends() -> (Vec<TiktokenTokenizer>, TempDir) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = write_synthetic_bpe_file(dir.path());
+        (explicit_backends(&path), dir)
+    }
+
+    /// Verify that tiktoken decode uses lossy UTF-8 (producing `\u{FFFD}`)
+    /// rather than returning an error for incomplete multi-byte sequences.
+    /// This is critical for streaming decode — `DecodeStream` relies on
+    /// `\u{FFFD}` to detect incomplete characters.
+    #[test]
+    fn tiktoken_decode_incomplete_utf8_produces_replacement_char() {
+        let (backends, _dir) = tiktoken_backends();
+
+        for backend in backends {
+            let ids = backend.encode("你", false).unwrap();
+            let full = backend.decode(&ids, false).unwrap();
+            assert_eq!(full, "你");
+
+            let text_with_multibyte = "Hello你好World";
+            let all_ids = backend.encode(text_with_multibyte, false).unwrap();
+            for &id in &all_ids {
+                let result = backend.decode(&[id], false);
+                assert!(result.is_ok(), "decode of token {id} should not error");
+            }
+        }
+    }
+
+    #[test]
+    fn tiktoken_vocab_size_reports_upper_bound() {
+        // The synthetic BPE file has 256 base tokens (bytes 0..=255) and ships no
+        // sibling config, so the constructor uses the 256-slot reserved fallback,
+        // giving a vocab upper bound of 512.
+        let (backends, _dir) = tiktoken_backends();
+        for backend in backends {
+            assert_eq!(backend.vocab_size(), 512);
+        }
+    }
+
+    /// When `config.json` exposes a `vocab_size`, the reserved-token range must
+    /// be sized to it rather than to the 256-slot fallback. This is the
+    /// general (non-Kimi-specific) path: any tiktoken model whose own
+    /// `config.json` says e.g. `vocab_size = 280` should populate
+    /// reserved slots for `[num_base_tokens, 280)` and nothing beyond.
+    #[test]
+    fn tiktoken_reserved_range_uses_vocab_size_from_config_json() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let bpe_path = write_synthetic_bpe_file(dir.path());
+        // num_base_tokens = 256, vocab_size = 280 → reserved range = [256, 280) (24
+        // slots, smaller than the 256 fallback so we can prove the config value
+        // is honoured).
+        fs::write(dir.path().join("config.json"), r#"{"vocab_size": 280}"#)
+            .expect("write config.json");
+
+        for backend in explicit_backends(&bpe_path) {
+            // Inside the configured range: reserved placeholder, round-trips both ways.
+            let in_range_id: u32 = 270;
+            let placeholder = format!("<|reserved_token_{in_range_id}|>");
+            assert_eq!(backend.decode(&[in_range_id], false).unwrap(), placeholder);
+            assert_eq!(
+                backend.encode(&placeholder, false).unwrap(),
+                vec![in_range_id]
+            );
+            assert_eq!(
+                backend.id_to_token(in_range_id).as_deref(),
+                Some(placeholder.as_str())
+            );
+
+            // Outside the configured range: not registered as a reserved slot — falls
+            // through to the backend's unknown-id behavior. The point is that we *don't*
+            // over-populate beyond what the model actually exposes.
+            let out_of_range_id: u32 = 290;
+            let out_of_range_placeholder = format!("<|reserved_token_{out_of_range_id}|>");
+            assert_eq!(backend.decode(&[out_of_range_id], false).unwrap(), "");
+            assert_eq!(backend.token_to_id(&out_of_range_placeholder), None);
+            assert_eq!(backend.id_to_token(out_of_range_id), None);
+        }
+    }
+
+    /// Sparse/non-contiguous BPE ranks must still count as base-vocab ids.
+    ///
+    /// Regression shape:
+    /// - base vocabulary contains ids 0..=255 and also a normal BPE token at id 1000
+    /// - if `num_base_tokens` were computed as `encoder.len()` (257), id 1000 would be
+    ///   misclassified as special/reserved and disappear under `skip_special_tokens = true`
+    #[test]
+    fn tiktoken_sparse_base_ranks_are_not_misclassified_as_special() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let bpe_path = write_sparse_rank_bpe_file(dir.path());
+        fs::write(dir.path().join("config.json"), r#"{"vocab_size": 1002}"#)
+            .expect("write config.json");
+
+        for backend in explicit_backends(&bpe_path) {
+            let sparse_id = backend.token_to_id("SPARSE");
+            assert_eq!(sparse_id, Some(1000));
+            assert_eq!(backend.id_to_token(1000).as_deref(), Some("SPARSE"));
+            assert!(!backend.is_special_id(1000));
+            assert_eq!(backend.decode(&[1000], false).unwrap(), "SPARSE");
+            assert_eq!(backend.decode(&[1000], true).unwrap(), "SPARSE");
+        }
+    }
+
+    /// `skip_special_tokens` must:
+    ///  * keep regular BPE token text unchanged,
+    ///  * drop ids whose `added_tokens_decoder` entry says `"special": true`,
+    ///  * drop reserved-slot placeholder ids (which default to special),
+    ///  * keep ids whose `added_tokens_decoder` entry says `"special": false` — this is how Kimi K2
+    ///    / K2.5 marks tool-call markers and `<think>` / `</think>`.
+    ///
+    /// Synthetic backend has `num_base_tokens = 256`. We write a
+    /// `tokenizer_config.json` that names ids 257 (special) and 258
+    /// (non-special), and a `config.json` with `vocab_size` covering both.
+    /// Id 259 stays a default reserved placeholder (special).
+    #[test]
+    fn tiktoken_skip_special_tokens_filters_special_but_keeps_non_special_added_tokens() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let bpe_path = write_synthetic_bpe_file(dir.path());
+        fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{
+                "added_tokens_decoder": {
+                    "257": { "content": "<|im_end|>", "special": true },
+                    "258": { "content": "<|tool_call_begin|>", "special": false }
+                }
+            }"#,
+        )
+        .expect("write tokenizer_config.json");
+        fs::write(dir.path().join("config.json"), r#"{"vocab_size": 260}"#)
+            .expect("write config.json");
+
+        for backend in explicit_backends(&bpe_path) {
+            // Resolve the BPE ids for "Hi" so we can interleave them with special-token
+            // ids.
+            let h = backend.encode("H", false).unwrap()[0];
+            let i = backend.encode("i", false).unwrap()[0];
+
+            let special_id: u32 = 257; // <|im_end|>
+            let non_special_id: u32 = 258; // <|tool_call_begin|>
+            let reserved_id: u32 = 259; // default <|reserved_token_259|> placeholder
+
+            let ids = vec![h, special_id, i, non_special_id, reserved_id];
+
+            // skip_special_tokens = false: everything is rendered as-is.
+            let kept = backend.decode(&ids, false).unwrap();
+            assert_eq!(
+                kept,
+                "H<|im_end|>i<|tool_call_begin|><|reserved_token_259|>"
+            );
+
+            // skip_special_tokens = true: special token (257) and reserved placeholder
+            // (259) are dropped; the non-special added token (258) survives.
+            let stripped = backend.decode(&ids, true).unwrap();
+            assert_eq!(stripped, "Hi<|tool_call_begin|>");
+        }
+    }
+
+    #[test]
+    fn tiktoken_ordinary_bypasses_every_registered_added_token() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let bpe_path = write_synthetic_bpe_file(dir.path());
+        fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{
+                "added_tokens_decoder": {
+                    "257": { "content": "<|im_end|>", "special": true },
+                    "258": { "content": "<|tool_call_begin|>", "special": false }
+                }
+            }"#,
+        )
+        .expect("write tokenizer_config.json");
+        fs::write(dir.path().join("config.json"), r#"{"vocab_size": 260}"#)
+            .expect("write config.json");
+
+        let input = "<|im_end|><|tool_call_begin|><|reserved_token_259|>";
+        let expected: Vec<u32> = input.as_bytes().iter().copied().map(u32::from).collect();
+        for backend in explicit_backends(&bpe_path) {
+            assert_eq!(backend.encode("<|im_end|>", false).unwrap(), vec![257]);
+            assert_eq!(
+                backend.encode("<|tool_call_begin|>", false).unwrap(),
+                vec![258]
+            );
+            assert_eq!(
+                backend.encode("<|reserved_token_259|>", false).unwrap(),
+                vec![259]
+            );
+            assert_eq!(backend.encode_ordinary(input).unwrap(), expected);
+        }
+    }
+
+    /// `vocab_size` may live under `text_config` for composite (e.g.
+    /// multimodal) configs.
+    #[test]
+    fn tiktoken_reserved_range_reads_text_config_vocab_size() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let bpe_path = write_synthetic_bpe_file(dir.path());
+        fs::write(
+            dir.path().join("config.json"),
+            r#"{"text_config": {"vocab_size": 270}}"#,
+        )
+        .expect("write config.json");
+
+        for backend in explicit_backends(&bpe_path) {
+            let in_range_id: u32 = 260;
+            let placeholder = format!("<|reserved_token_{in_range_id}|>");
+            assert_eq!(backend.decode(&[in_range_id], false).unwrap(), placeholder);
+
+            // Just outside the nested vocab_size — should not be registered.
+            assert_eq!(backend.decode(&[270], false).unwrap(), "");
+        }
+    }
+
+    #[test]
+    fn tiktoken_detects_kimi_pattern_from_model_type() {
+        let kimi = config_json!({ "model_type": "kimi_k25" });
+        let kimi_k3 = config_json!({ "model_type": "kimi_k3" });
+        let baseten_kimi = config_json!({ "model_type": "deepseek_v3" });
+        let nested_kimi = config_json!({
+            "model_type": "composite_wrapper",
+            "text_config": { "model_type": "kimi_k2" }
+        });
+        let generic = config_json!({ "model_type": "gpt2" });
+        let nested_generic = config_json!({
+            "model_type": "composite_wrapper",
+            "text_config": { "model_type": "gpt2" }
+        });
+        let missing = config_json!({ "text_config": {} });
+
+        assert_eq!(detect_bpe_pattern(&kimi), KIMI_PATTERN);
+        assert_eq!(detect_bpe_pattern(&kimi_k3), KIMI_PATTERN);
+        assert_eq!(detect_bpe_pattern(&baseten_kimi), KIMI_PATTERN);
+        assert_eq!(detect_bpe_pattern(&nested_kimi), CL100K_BASE_PATTERN);
+        assert_eq!(detect_bpe_pattern(&generic), CL100K_BASE_PATTERN);
+        assert_eq!(detect_bpe_pattern(&nested_generic), CL100K_BASE_PATTERN);
+        assert_eq!(detect_bpe_pattern(&missing), CL100K_BASE_PATTERN);
+    }
+
+    #[test]
+    fn tiktoken_reads_model_type_from_text_config_when_top_level_missing() {
+        let nested_only = config_json!({
+            "text_config": { "model_type": "kimi_k2" }
+        });
+        let direct_and_nested = config_json!({
+            "model_type": "kimi_k25",
+            "text_config": { "model_type": "kimi_k2" }
+        });
+        let missing = config_json!({
+            "text_config": {}
+        });
+
+        assert_eq!(nested_only.effective_model_type(), Some("kimi_k2"));
+        assert_eq!(direct_and_nested.effective_model_type(), Some("kimi_k25"));
+        assert_eq!(missing.effective_model_type(), None);
+    }
+
+    #[test]
+    fn tiktoken_tokenizer_config_models_added_tokens_decoder() {
+        let config: TiktokenTokenizerConfig = serde_json::from_value(serde_json::json!({
+            "added_tokens_decoder": {
+                "257": { "content": "<think>" },
+                "258": { "content": "</think>", "special": true }
+            }
+        }))
+        .unwrap();
+
+        let added_tokens = config.added_tokens_decoder;
+        assert_eq!(added_tokens.len(), 2);
+        assert_eq!(
+            added_tokens.get(&257).map(|t| t.content.as_str()),
+            Some("<think>")
+        );
+        assert_eq!(added_tokens.get(&257).map(|t| t.special), Some(false));
+        assert_eq!(
+            added_tokens.get(&258).map(|t| (t.content.as_str(), t.special)),
+            Some(("</think>", true))
+        );
+    }
+
+    /// Reserved token ids in `[num_base_tokens, num_base_tokens + 256)` must
+    /// decode to their placeholder name (matching `tokenization_kimi.py`'s
+    /// `<|reserved_token_{i}|>` format), even when the source
+    /// `tokenizer_config.json` does not list them in `added_tokens_decoder`.
+    ///
+    /// In our synthetic backend `num_base_tokens = 256` (256 single-byte BPE
+    /// tokens), so the reserved range is `[256, 512)`. Picking id 300 —
+    /// well inside that range and absent from any `added_tokens_decoder` —
+    /// should round-trip both ways.
+    #[test]
+    fn tiktoken_reserved_token_round_trip() {
+        let (backends, _dir) = tiktoken_backends();
+
+        for backend in backends {
+            let reserved_id: u32 = 300;
+            let placeholder = format!("<|reserved_token_{reserved_id}|>");
+
+            let decoded = backend.decode(&[reserved_id], false).unwrap();
+            assert_eq!(decoded, placeholder);
+
+            // The placeholder name should also encode back to the same single id, since
+            // the constructor registers it as a special token with `CoreBPE`.
+            let encoded = backend.encode(&placeholder, false).unwrap();
+            assert_eq!(encoded, vec![reserved_id]);
+
+            assert_eq!(backend.token_to_id(&placeholder), Some(reserved_id));
+            assert_eq!(
+                backend.id_to_token(reserved_id).as_deref(),
+                Some(placeholder.as_str())
+            );
+        }
+    }
+
+    /// Decoding a token id that is beyond even the reserved range must not
+    /// panic — it falls through to the warn-and-skip backstop instead of
+    /// crashing the worker thread.
+    #[test]
+    fn tiktoken_rs_decode_unknown_token_id_does_not_panic() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = write_synthetic_bpe_file(dir.path());
+        let backend = TiktokenTokenizer::new_tiktoken_rs(&path).expect("load tiktoken-rs backend");
+
+        // ID well above num_base_tokens (256) + reserved (256) = 512 — guaranteed
+        // unknown.
+        let unknown_id: u32 = 999_999;
+        let result = backend.decode(&[unknown_id], false);
+        assert_eq!(result.unwrap(), "");
+
+        // Mixed: known bytes for "Hi" surrounding an unknown id should yield just "Hi".
+        let h = backend.encode("H", false).unwrap()[0];
+        let i = backend.encode("i", false).unwrap()[0];
+        let result = backend.decode(&[h, unknown_id, i], false).unwrap();
+        assert_eq!(result, "Hi");
+    }
+
+    #[test]
+    fn riptoken_decode_unknown_token_id_does_not_panic() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = write_synthetic_bpe_file(dir.path());
+        let backend = TiktokenTokenizer::new_riptoken(&path).expect("load riptoken backend");
+
+        let unknown_id: u32 = 999_999;
+        assert_eq!(backend.decode(&[unknown_id], false).unwrap(), "");
+
+        let h = backend.encode("H", false).unwrap()[0];
+        let i = backend.encode("i", false).unwrap()[0];
+        assert_eq!(backend.decode(&[h, unknown_id, i], false).unwrap(), "Hi");
+    }
+
+    /// Streaming decode of CJK text through tiktoken should produce the
+    /// original text without errors, even though individual tokens may
+    /// represent partial UTF-8 byte sequences.
+    #[test]
+    fn tiktoken_streaming_decode_multibyte() {
+        let (backends, _dir) = tiktoken_backends();
+        for backend in backends {
+            let text = "你好世界"; // 4 CJK characters
+            let ids = backend.encode(text, false).unwrap();
+
+            let mut decoder = backend.create_decode_stream(&[], false, 0);
+            let mut output = String::new();
+            for &id in &ids {
+                decoder.push_token(id).unwrap();
+                if let Some(chunk) = decoder.next_chunk() {
+                    output.push_str(&chunk);
+                }
+            }
+            let (last_chunk, full_text) = decoder.flush(None).unwrap();
+            if let Some(chunk) = last_chunk {
+                output.push_str(&chunk);
+            }
+
+            assert_eq!(output, text);
+            assert_eq!(full_text, text);
+        }
+    }
+
+    /// Mixed ASCII and multi-byte text should stream correctly through
+    /// tiktoken.
+    #[test]
+    fn tiktoken_streaming_decode_mixed_ascii_and_multibyte() {
+        let (backends, _dir) = tiktoken_backends();
+        for backend in backends {
+            let text = "Hello 你好 World 🌍";
+            let ids = backend.encode(text, false).unwrap();
+
+            let mut decoder = backend.create_decode_stream(&[], false, 0);
+            let mut output = String::new();
+            for &id in &ids {
+                decoder.push_token(id).unwrap();
+                if let Some(chunk) = decoder.next_chunk() {
+                    output.push_str(&chunk);
+                }
+            }
+            let (last_chunk, full_text) = decoder.flush(None).unwrap();
+            if let Some(chunk) = last_chunk {
+                output.push_str(&chunk);
+            }
+
+            assert_eq!(output, text);
+            assert_eq!(full_text, text);
+        }
+    }
+
+    #[test]
+    fn tiktoken_token_to_id_resolves_added_special_tokens() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let bpe_path = write_synthetic_bpe_file(dir.path());
+        fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{
+                "added_tokens_decoder": {
+                    "257": { "content": "<think>", "special": false },
+                    "258": { "content": "</think>", "special": false }
+                }
+            }"#,
+        )
+        .expect("write tokenizer_config.json");
+        fs::write(dir.path().join("config.json"), r#"{"vocab_size": 259}"#)
+            .expect("write config.json");
+
+        for backend in explicit_backends(&bpe_path) {
+            assert_eq!(backend.token_to_id("<think>"), Some(257));
+            assert_eq!(backend.token_to_id("</think>"), Some(258));
+            assert_eq!(backend.id_to_token(257).as_deref(), Some("<think>"));
+            assert_eq!(backend.id_to_token(258).as_deref(), Some("</think>"));
+            assert_eq!(
+                backend.decode(&[257, 258], true).unwrap(),
+                "<think></think>"
+            );
+        }
+    }
+
+    #[test]
+    fn riptoken_token_to_id_uses_encode_single_token_path() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let bpe_path = write_synthetic_bpe_file(dir.path());
+        fs::write(
+            dir.path().join("tokenizer_config.json"),
+            r#"{
+                "added_tokens_decoder": {
+                    "257": { "content": "<think>", "special": false }
+                }
+            }"#,
+        )
+        .expect("write tokenizer_config.json");
+        fs::write(dir.path().join("config.json"), r#"{"vocab_size": 258}"#)
+            .expect("write config.json");
+        let backend = TiktokenTokenizer::new_riptoken(&bpe_path).expect("load riptoken backend");
+
+        assert_eq!(backend.token_to_id("H"), Some(b'H' as u32));
+        assert_eq!(backend.id_to_token(b'H' as u32).as_deref(), Some("H"));
+        assert_eq!(backend.token_to_id("<think>"), Some(257));
+        assert_eq!(backend.id_to_token(257).as_deref(), Some("<think>"));
+    }
+
+    #[test]
+    fn tiktoken_rs_token_to_id_handles_unknown_special_like_text_without_panicking() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = write_synthetic_bpe_file(dir.path());
+        let backend = TiktokenTokenizer::new_tiktoken_rs(&path).expect("load tiktoken-rs backend");
+
+        assert_eq!(backend.token_to_id("<|definitely_not_registered|>"), None);
+    }
+
+    #[test]
+    fn riptoken_token_to_id_handles_unknown_special_like_text_without_panicking() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = write_synthetic_bpe_file(dir.path());
+        let backend = TiktokenTokenizer::new_riptoken(&path).expect("load riptoken backend");
+
+        assert_eq!(backend.token_to_id("<|definitely_not_registered|>"), None);
+    }
+}

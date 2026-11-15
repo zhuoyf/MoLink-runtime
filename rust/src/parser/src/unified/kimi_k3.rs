@@ -564,3 +564,564 @@ fn xtml_error(label: &'static str) -> ErrMode<ContextError> {
     error.push(StrContext::Label(label));
     ErrMode::Cut(error)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::{Value, json};
+    use thiserror_ext::AsReport;
+    use vllm_tokenizer::Tokenizer as _;
+    use vllm_tokenizer::test_utils::TestTokenizer;
+
+    use super::{
+        END_OF_MSG, KimiK3UnifiedParser, OPEN, RESPONSE_CLOSE, RESPONSE_OPEN, SEP, THINK_CLOSE,
+        THINK_OPEN, TOOLS_CLOSE, TOOLS_OPEN,
+    };
+    use crate::tool::ToolCallDelta;
+    use crate::unified::{
+        UnifiedParser, UnifiedParserError, UnifiedParserEvent, UnifiedParserOutput,
+    };
+
+    const OPEN_ID: u32 = 256;
+    const CLOSE_ID: u32 = 257;
+    const SEP_ID: u32 = 258;
+    const END_OF_MSG_ID: u32 = 259;
+
+    fn tokenizer() -> TestTokenizer {
+        TestTokenizer::new()
+            .with_special_token(OPEN, OPEN_ID)
+            .with_special_token("<|close|>", CLOSE_ID)
+            .with_special_token(SEP, SEP_ID)
+            .with_special_token(END_OF_MSG, END_OF_MSG_ID)
+    }
+
+    trait UnifiedParserTestExt {
+        fn parse_chunk(&mut self, chunk: &str) -> super::Result<UnifiedParserOutput>;
+        fn parse_complete(&mut self, text: &str) -> super::Result<UnifiedParserOutput>;
+    }
+
+    impl UnifiedParserTestExt for KimiK3UnifiedParser {
+        fn parse_chunk(&mut self, chunk: &str) -> super::Result<UnifiedParserOutput> {
+            let mut output = UnifiedParserOutput::default();
+            self.parse_into(chunk, &mut output)?;
+            Ok(output)
+        }
+
+        fn parse_complete(&mut self, text: &str) -> super::Result<UnifiedParserOutput> {
+            let mut output = self.parse_chunk(text)?;
+            output.append(self.finish()?);
+            Ok(output)
+        }
+    }
+
+    trait UnifiedOutputTestExt {
+        fn normal_text(&self) -> String;
+        fn reasoning_text(&self) -> String;
+        fn calls(&self) -> Vec<ToolCallDelta>;
+    }
+
+    impl UnifiedOutputTestExt for UnifiedParserOutput {
+        fn normal_text(&self) -> String {
+            self.events
+                .iter()
+                .filter_map(|event| match event {
+                    UnifiedParserEvent::Text(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn reasoning_text(&self) -> String {
+            self.events
+                .iter()
+                .filter_map(|event| match event {
+                    UnifiedParserEvent::Reasoning(text) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn calls(&self) -> Vec<ToolCallDelta> {
+            self.events
+                .iter()
+                .filter_map(|event| match event {
+                    UnifiedParserEvent::ToolCall(call) => Some(call.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    fn test_parser() -> KimiK3UnifiedParser {
+        KimiK3UnifiedParser::new(&[], Arc::new(tokenizer())).unwrap()
+    }
+
+    fn collect_stream(parser: &mut KimiK3UnifiedParser, chunks: &[&str]) -> UnifiedParserOutput {
+        let mut output = UnifiedParserOutput::default();
+        for chunk in chunks {
+            output.append(parser.parse_chunk(chunk).unwrap());
+        }
+        output.append(parser.finish().unwrap());
+        output
+    }
+
+    /// Split `text` into small chunks to stress marker-split handling.
+    fn char_chunks(text: &str, size: usize) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        chars.chunks(size).map(|chunk| chunk.iter().collect()).collect()
+    }
+
+    fn arg(key: &str, arg_type: &str, value: &str) -> String {
+        format!(
+            "{OPEN}argument key=\"{key}\" type=\"{arg_type}\"{SEP}{value}<|close|>argument{SEP}"
+        )
+    }
+
+    fn call(attrs: &str, body: &str) -> String {
+        format!("{OPEN}call {attrs}{SEP}{body}<|close|>call{SEP}")
+    }
+
+    fn thinking_output(reasoning: &str, response: &str, tools_body: &str) -> String {
+        let mut output = format!("{THINK_OPEN}{reasoning}{THINK_CLOSE}");
+        output.push_str(&format!("{RESPONSE_OPEN}{response}{RESPONSE_CLOSE}"));
+        if !tools_body.is_empty() {
+            output.push_str(&format!("{TOOLS_OPEN}{tools_body}{TOOLS_CLOSE}"));
+        }
+        output.push_str("<|close|>message<|sep|>");
+        output
+    }
+
+    fn first_call(output: &UnifiedParserOutput) -> ToolCallDelta {
+        output.calls().first().expect("expected one tool call").clone()
+    }
+
+    #[test]
+    fn kimi_k3_create_requires_structural_tokens() {
+        let error = match KimiK3UnifiedParser::new(&[], Arc::new(TestTokenizer::new())) {
+            Ok(_) => panic!("expected missing token error"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            UnifiedParserError::MissingToken { token } if token == OPEN
+        ));
+    }
+
+    #[test]
+    fn kimi_k3_parses_reasoning_response_and_typed_tool_call() {
+        let body = [
+            arg("city", "string", "Hangzhou"),
+            arg("days", "number", "1.5"),
+            arg("detailed", "boolean", "true"),
+            arg("filters", "object", r#"{"kind":"rain"}"#),
+            arg("hours", "array", "[8,20]"),
+        ]
+        .concat();
+        let text = thinking_output(
+            "Need the weather tool.",
+            "I'll check.",
+            &call("tool=\"get_weather\" index=\"1\"", &body),
+        );
+
+        let mut parser = test_parser();
+        let output = parser.parse_complete(&text).unwrap();
+
+        assert_eq!(output.reasoning_text(), "Need the weather tool.");
+        assert_eq!(output.normal_text(), "I'll check.");
+        let call = first_call(&output);
+        assert_eq!(call.tool_index, 0);
+        assert_eq!(call.name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&call.arguments).unwrap(),
+            json!({
+                "city": "Hangzhou",
+                "days": 1.5,
+                "detailed": true,
+                "filters": { "kind": "rain" },
+                "hours": [8, 20],
+            })
+        );
+    }
+
+    #[test]
+    fn kimi_k3_arguments_preserve_order_and_number_formatting() {
+        let body = [
+            arg("y", "number", "1.0"),
+            arg("x", "number", "2"),
+            arg("items", "array", r#"["left","right"]"#),
+        ]
+        .concat();
+        let text = thinking_output("t", "", &call("tool=\"add\" index=\"1\"", &body));
+
+        let mut parser = test_parser();
+        let output = parser.parse_complete(&text).unwrap();
+
+        assert_eq!(
+            first_call(&output).arguments,
+            r#"{"y":1.0,"x":2,"items":["left","right"]}"#
+        );
+    }
+
+    #[test]
+    fn kimi_k3_streaming_splits_markers_across_chunks() {
+        let text = thinking_output(
+            "step by step",
+            "the answer",
+            &call("tool=\"calc\" index=\"1\"", &arg("x", "number", "42")),
+        );
+
+        for size in [1, 3, 7] {
+            let chunks = char_chunks(&text, size);
+            let chunk_refs: Vec<&str> = chunks.iter().map(String::as_str).collect();
+            let output = collect_stream(&mut test_parser(), &chunk_refs);
+
+            assert_eq!(output.reasoning_text(), "step by step", "chunk size {size}");
+            assert_eq!(output.normal_text(), "the answer", "chunk size {size}");
+            assert_eq!(first_call(&output).name.as_deref(), Some("calc"));
+            assert_eq!(first_call(&output).arguments, r#"{"x":42}"#);
+        }
+    }
+
+    #[test]
+    fn kimi_k3_streaming_emits_text_incrementally() {
+        let mut parser = test_parser();
+        let prompt = tokenizer().encode("<|open|>response<|sep|>", false).unwrap();
+        parser.initialize(&prompt).unwrap();
+
+        let first = parser.parse_chunk("Hel").unwrap();
+        assert_eq!(first.normal_text(), "Hel");
+
+        let second = parser.parse_chunk("lo<|close|>resp").unwrap();
+        assert_eq!(second.normal_text(), "lo");
+
+        let mut output = parser.parse_chunk("onse<|sep|>").unwrap();
+        output.append(parser.finish().unwrap());
+        assert_eq!(output.normal_text(), "");
+    }
+
+    #[test]
+    fn kimi_k3_initialize_think_prefill_starts_in_reasoning() {
+        let mut parser = test_parser();
+        let prompt = tokenizer()
+            .encode(
+                "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+                false,
+            )
+            .unwrap();
+        parser.initialize(&prompt).unwrap();
+
+        let output = parser
+            .parse_complete(&format!(
+                "reasoning{THINK_CLOSE}{RESPONSE_OPEN}answer{RESPONSE_CLOSE}<|close|>message{SEP}"
+            ))
+            .unwrap();
+
+        assert_eq!(output.reasoning_text(), "reasoning");
+        assert_eq!(output.normal_text(), "answer");
+    }
+
+    #[test]
+    fn kimi_k3_initialize_response_prefill_starts_in_response() {
+        let mut parser = test_parser();
+        let prompt = tokenizer()
+            .encode(
+                "<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>",
+                false,
+            )
+            .unwrap();
+        parser.initialize(&prompt).unwrap();
+
+        let output = parser
+            .parse_complete(&format!("answer{RESPONSE_CLOSE}<|close|>message{SEP}"))
+            .unwrap();
+
+        assert_eq!(output.normal_text(), "answer");
+        assert!(output.reasoning_text().is_empty());
+    }
+
+    #[test]
+    fn kimi_k3_initialize_message_open_prefill_starts_idle() {
+        let mut parser = test_parser();
+        let prompt =
+            tokenizer().encode("<|open|>message role=\"assistant\"<|sep|>", false).unwrap();
+        parser.initialize(&prompt).unwrap();
+
+        let output = parser
+            .parse_complete(&format!("{THINK_OPEN}reason{THINK_CLOSE}{RESPONSE_OPEN}hi"))
+            .unwrap();
+
+        assert_eq!(output.reasoning_text(), "reason");
+        assert_eq!(output.normal_text(), "hi");
+    }
+
+    #[test]
+    fn kimi_k3_plain_text_falls_through_as_text() {
+        let output = collect_stream(&mut test_parser(), &["plain ", "answer"]);
+
+        assert_eq!(output.normal_text(), "plain answer");
+        assert!(output.reasoning_text().is_empty());
+        assert!(output.calls().is_empty());
+    }
+
+    #[test]
+    fn kimi_k3_tool_call_waits_for_close_marker() {
+        let mut parser = test_parser();
+        let mut output = UnifiedParserOutput::default();
+
+        let argument = arg("x", "number", "1");
+        for chunk in [
+            TOOLS_OPEN,
+            "<|open|>call tool=\"calc\" index=\"1\"<|sep|>",
+            argument.as_str(),
+        ] {
+            output.append(parser.parse_chunk(chunk).unwrap());
+            assert!(output.calls().is_empty());
+        }
+
+        output.append(parser.parse_chunk("<|close|>call<|sep|>").unwrap());
+
+        assert_eq!(first_call(&output).name.as_deref(), Some("calc"));
+        assert_eq!(first_call(&output).arguments, r#"{"x":1}"#);
+    }
+
+    #[test]
+    fn kimi_k3_parses_multiple_tool_calls() {
+        let tools_body = format!(
+            "{}{}",
+            call(
+                "tool=\"get_weather\" index=\"1\"",
+                &arg("city", "string", "SF")
+            ),
+            call("tool=\"get_time\" index=\"2\"", ""),
+        );
+        let text = thinking_output("t", "r", &tools_body);
+
+        let mut parser = test_parser();
+        let output = parser.parse_complete(&text).unwrap();
+
+        let calls = output.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].tool_index, 0);
+        assert_eq!(calls[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(calls[0].arguments, r#"{"city":"SF"}"#);
+        assert_eq!(calls[1].tool_index, 1);
+        assert_eq!(calls[1].name.as_deref(), Some("get_time"));
+        assert_eq!(calls[1].arguments, "{}");
+    }
+
+    #[test]
+    fn kimi_k3_json_block_arguments_pass_through_raw() {
+        // Spacing and key order must survive unmodified: raw `json` blocks are
+        // not validated or normalized.
+        let raw = r#"{"b": 1,  "a": [2 , 3]}"#;
+        let body = format!("{OPEN}json type=\"object\"{SEP}{raw}<|close|>json{SEP}");
+        let text = thinking_output("t", "", &call("tool=\"run\" index=\"1\"", &body));
+
+        let mut parser = test_parser();
+        let output = parser.parse_complete(&text).unwrap();
+
+        assert_eq!(first_call(&output).arguments, raw);
+    }
+
+    #[test]
+    fn kimi_k3_string_argument_passes_raw_text_through() {
+        let value = "line one\nline two {\"not\": \"json\"} & <tags>";
+        let text = thinking_output(
+            "t",
+            "",
+            &call(
+                "tool=\"write\" index=\"1\"",
+                &arg("content", "string", value),
+            ),
+        );
+
+        let mut parser = test_parser();
+        let output = parser.parse_complete(&text).unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&first_call(&output).arguments).unwrap(),
+            json!({ "content": value })
+        );
+    }
+
+    #[test]
+    fn kimi_k3_malformed_typed_argument_falls_back_to_raw_text() {
+        let text = thinking_output(
+            "t",
+            "",
+            &call(
+                "tool=\"calc\" index=\"1\"",
+                &arg("x", "number", "not a number"),
+            ),
+        );
+
+        let mut parser = test_parser();
+        let output = parser.parse_complete(&text).unwrap();
+
+        assert_eq!(first_call(&output).arguments, r#"{"x":"not a number"}"#);
+    }
+
+    #[test]
+    fn kimi_k3_attribute_values_are_unescaped() {
+        let text = thinking_output(
+            "t",
+            "",
+            &call(
+                "tool=\"a&quot;b&amp;c\" index=\"1\"",
+                &arg("key", "string", "value"),
+            ),
+        );
+
+        let mut parser = test_parser();
+        let output = parser.parse_complete(&text).unwrap();
+
+        assert_eq!(first_call(&output).name.as_deref(), Some("a\"b&c"));
+    }
+
+    #[test]
+    fn kimi_k3_call_without_tool_name_is_dropped() {
+        let tools_body = format!(
+            "{}{}",
+            call("index=\"1\"", &arg("x", "number", "1")),
+            call("tool=\"real\" index=\"2\"", ""),
+        );
+        let text = thinking_output("t", "", &tools_body);
+
+        let mut parser = test_parser();
+        let output = parser.parse_complete(&text).unwrap();
+
+        let calls = output.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool_index, 0);
+        assert_eq!(calls[0].name.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn kimi_k3_tool_indices_ignore_xtml_index_attribute() {
+        let tools_body = format!(
+            "{}{}{}",
+            call("tool=\"first\" index=\"3\"", ""),
+            call("tool=\"second\"", ""),
+            call("tool=\"third\" index=\"x\"", ""),
+        );
+        let text = thinking_output("t", "", &tools_body);
+
+        let mut parser = test_parser();
+        let output = parser.parse_complete(&text).unwrap();
+
+        assert_eq!(
+            output.calls().iter().map(|call| call.tool_index).collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn kimi_k3_ignores_output_after_message_close() {
+        let mut parser = test_parser();
+        let output = parser
+            .parse_complete(&format!(
+                "{RESPONSE_OPEN}answer{RESPONSE_CLOSE}<|close|>message{SEP}junk{END_OF_MSG}"
+            ))
+            .unwrap();
+
+        assert_eq!(output.normal_text(), "answer");
+    }
+
+    #[test]
+    fn kimi_k3_epilogue_noise_is_not_content() {
+        let text = format!(
+            "{RESPONSE_OPEN}answer{RESPONSE_CLOSE}\n{TOOLS_OPEN}{}{TOOLS_CLOSE}\n<|close|>message{SEP}",
+            call("tool=\"calc\" index=\"1\"", ""),
+        );
+
+        let mut parser = test_parser();
+        let output = parser.parse_complete(&text).unwrap();
+
+        assert_eq!(output.normal_text(), "answer");
+        assert_eq!(output.calls().len(), 1);
+    }
+
+    #[test]
+    fn kimi_k3_finish_flushes_unclosed_reasoning() {
+        let mut parser = test_parser();
+        let mut output = parser.parse_chunk(&format!("{THINK_OPEN}still thinking")).unwrap();
+        output.append(parser.finish().unwrap());
+
+        assert_eq!(output.reasoning_text(), "still thinking");
+        assert!(output.normal_text().is_empty());
+    }
+
+    #[test]
+    fn kimi_k3_finish_flushes_partial_marker_as_text() {
+        let mut parser = test_parser();
+        let mut output = parser.parse_chunk("answer<|clo").unwrap();
+        output.append(parser.finish().unwrap());
+
+        assert_eq!(output.normal_text(), "answer<|clo");
+    }
+
+    #[test]
+    fn kimi_k3_finish_fails_mid_tool_call() {
+        let mut parser = test_parser();
+        parser
+            .parse_chunk(&format!(
+                "{TOOLS_OPEN}<|open|>call tool=\"calc\" index=\"1\"<|sep|>{}",
+                arg("x", "number", "1")
+            ))
+            .unwrap();
+
+        let error = parser.finish().unwrap_err();
+
+        assert!(error.to_report_string().contains("incomplete Kimi K3 tool call"));
+    }
+
+    #[test]
+    fn kimi_k3_finish_after_truncated_tools_keeps_complete_calls() {
+        let mut parser = test_parser();
+        let mut output = parser
+            .parse_chunk(&format!(
+                "{TOOLS_OPEN}{}",
+                call("tool=\"calc\" index=\"1\"", &arg("x", "number", "1"))
+            ))
+            .unwrap();
+        output.append(parser.finish().unwrap());
+
+        assert_eq!(first_call(&output).name.as_deref(), Some("calc"));
+    }
+
+    #[test]
+    fn kimi_k3_malformed_call_attributes_fail_fast() {
+        let mut parser = test_parser();
+        let error = parser
+            .parse_chunk(&format!("{TOOLS_OPEN}<|open|>call garbage attrs<|sep|>"))
+            .unwrap_err();
+
+        assert!(error.to_report_string().contains("XTML tag attributes"));
+    }
+
+    #[test]
+    fn kimi_k3_empty_response_channel_emits_nothing() {
+        let text = thinking_output("t", "", &call("tool=\"calc\" index=\"1\"", ""));
+
+        let mut parser = test_parser();
+        let output = parser.parse_complete(&text).unwrap();
+
+        assert!(output.normal_text().is_empty());
+        assert_eq!(output.reasoning_text(), "t");
+        assert_eq!(output.calls().len(), 1);
+    }
+
+    #[test]
+    fn kimi_k3_reset_returns_buffered_text() {
+        let mut parser = test_parser();
+        let prompt = tokenizer().encode("<|open|>response<|sep|>", false).unwrap();
+        parser.initialize(&prompt).unwrap();
+        parser.parse_chunk("answer<|close|>resp").unwrap();
+
+        let raw = parser.reset();
+
+        assert_eq!(raw, "<|close|>resp");
+    }
+}

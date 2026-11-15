@@ -89,3 +89,94 @@ impl UnifiedParserFactory {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use vllm_tokenizer::test_utils::TestTokenizer;
+
+    use super::{UnifiedParserFactory, names};
+
+    fn tokenizer() -> TestTokenizer {
+        TestTokenizer::new()
+            .with_regular_token("<|channel>", 256)
+            .with_regular_token("<channel|>", 257)
+    }
+
+    fn inkling_tokenizer() -> TestTokenizer {
+        TestTokenizer::new()
+            .with_regular_token("<|message_model|>", 200001)
+            .with_regular_token("<|content_text|>", 200004)
+            .with_regular_token("<|content_thinking|>", 200008)
+    }
+
+    #[test]
+    fn factory_registers_gemma4() {
+        let factory = UnifiedParserFactory::new();
+
+        assert!(factory.contains(names::GEMMA4));
+        assert_eq!(
+            factory.resolve_name_for_model("google/gemma-4-27b-it"),
+            Some(names::GEMMA4)
+        );
+        factory.create(names::GEMMA4, &[], Arc::new(tokenizer())).unwrap();
+    }
+
+    #[test]
+    fn factory_registers_inkling() {
+        let factory = UnifiedParserFactory::new();
+
+        assert!(factory.contains(names::INKLING));
+        assert_eq!(
+            factory.resolve_name_for_model("thinkingmachines/Inkling"),
+            Some(names::INKLING)
+        );
+        factory.create(names::INKLING, &[], Arc::new(inkling_tokenizer())).unwrap();
+    }
+
+    #[test]
+    fn factory_registers_kimi_k3() {
+        let factory = UnifiedParserFactory::new();
+        let tokenizer = TestTokenizer::new()
+            .with_regular_token("<|open|>", 1001)
+            .with_regular_token("<|close|>", 1002)
+            .with_regular_token("<|sep|>", 1003);
+
+        assert!(factory.contains(names::KIMI_K3));
+        assert_eq!(
+            factory.resolve_name_for_model("moonshotai/Kimi-K3"),
+            Some(names::KIMI_K3)
+        );
+        factory.create(names::KIMI_K3, &[], Arc::new(tokenizer)).unwrap();
+    }
+
+    #[test]
+    fn factory_registers_hy_v4() {
+        let factory = UnifiedParserFactory::new();
+        let tokenizer = [
+            "<think:opensource>",
+            "</think:opensource>",
+            "<tool_calls:opensource>",
+            "</tool_calls:opensource>",
+            "<tool_call:opensource>",
+            "</tool_call:opensource>",
+            "<arg_key:opensource>",
+            "</arg_key:opensource>",
+            "<arg_value:opensource>",
+            "</arg_value:opensource>",
+        ]
+        .into_iter()
+        .enumerate()
+        .fold(TestTokenizer::new(), |tokenizer, (index, token)| {
+            tokenizer.with_regular_token(token, 1000 + index as u32)
+        });
+
+        assert!(factory.contains(names::HY_V4));
+        assert_eq!(
+            factory.resolve_name_for_model("tencent/Hy4-preview"),
+            Some(names::HY_V4)
+        );
+        factory.create(names::HY_V4, &[], Arc::new(tokenizer)).unwrap();
+    }
+}

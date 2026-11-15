@@ -481,3 +481,75 @@ fn format_position_rates(output: &mut String, rates: &[f64]) {
         write!(output, "{rate:.3}").unwrap();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_hit_rate_returns_percent_for_non_empty_queries() {
+        assert_eq!(cache_hit_rate(25, 100), 25.0);
+        assert_eq!(cache_hit_rate(0, 0), 0.0);
+    }
+
+    #[test]
+    fn spec_decoding_log_stats_uses_interval_deltas() {
+        let raw_log_stats = SchedulerLogStatsInterval {
+            spec_num_drafts: 4,
+            spec_accepted_tokens_per_pos: vec![4, 2, 1],
+            ..Default::default()
+        };
+        let prev = CounterSnapshot {
+            spec_decode_num_drafts: 10,
+            spec_decode_num_draft_tokens: 100,
+            spec_decode_num_accepted_tokens: 40,
+            ..Default::default()
+        };
+        let curr = CounterSnapshot {
+            spec_decode_num_drafts: 14,
+            spec_decode_num_draft_tokens: 120,
+            spec_decode_num_accepted_tokens: 52,
+            ..Default::default()
+        };
+
+        let stats = spec_decoding_log_stats(&curr, &prev, 2.0, &raw_log_stats).unwrap();
+
+        assert_eq!(stats.mean_acceptance_length, 4.0);
+        assert_eq!(stats.accepted_throughput, 6.0);
+        assert_eq!(stats.draft_throughput, 10.0);
+        assert_eq!(stats.accepted_tokens, 12);
+        assert_eq!(stats.draft_tokens, 20);
+        assert_eq!(stats.per_position_acceptance_rates, vec![1.0, 0.5, 0.25]);
+        assert_eq!(stats.draft_acceptance_rate, 60.0);
+    }
+
+    #[test]
+    fn mfu_log_stats_averages_per_gpu_across_engines() {
+        let prev = CounterSnapshot {
+            estimated_flops_per_gpu: 10,
+            estimated_read_bytes_per_gpu: 10,
+            estimated_write_bytes_per_gpu: 10,
+            ..Default::default()
+        };
+        let curr = CounterSnapshot {
+            estimated_flops_per_gpu: 4_000_000_000_010,
+            estimated_read_bytes_per_gpu: 2_000_000_010,
+            estimated_write_bytes_per_gpu: 2_000_000_010,
+            ..Default::default()
+        };
+
+        let stats = mfu_log_stats(&curr, &prev, 2.0, 2).unwrap();
+
+        assert_eq!(stats.tflops_per_gpu, 1.0);
+        assert_eq!(stats.gbps_per_gpu, 1.0);
+    }
+
+    #[test]
+    fn format_position_rates_uses_three_decimal_places() {
+        let mut output = String::new();
+
+        format_position_rates(&mut output, &[1.0, 0.5, 0.25]);
+
+        assert_eq!(output, "1.000, 0.500, 0.250");
+    }
+}

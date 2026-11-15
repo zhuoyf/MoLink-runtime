@@ -294,3 +294,79 @@ fn token_bytes(token: &str) -> Vec<u8> {
 pub fn clamp_logprob(logprob: f32) -> f32 {
     logprob.max(-9999.0)
 }
+
+#[cfg(test)]
+mod tests {
+    use vllm_text::{DecodedLogprobs, DecodedPositionLogprobs, DecodedTokenLogprob};
+
+    use super::{decoded_logprobs_to_openai_chat, prompt_logprobs_to_maps};
+
+    #[test]
+    fn prompt_logprobs_maps_reject_missing_multi_token_payload() {
+        prompt_logprobs_to_maps(None, &[9707, 11])
+            .expect_err("multi-token prompt without payload is an engine failure");
+    }
+
+    #[test]
+    fn prompt_logprobs_maps_preserve_token_ids_and_metadata() {
+        let prompt_logprobs = vllm_text::DecodedPromptLogprobs {
+            first_token_id: 10,
+            first_token: "first".to_string(),
+            scored_positions: sample_logprobs().positions,
+        };
+
+        let maps = prompt_logprobs_to_maps(Some(&prompt_logprobs), &[10, 1]).expect("maps");
+        assert_eq!(
+            serde_json::to_value(maps).expect("serialize prompt logprobs"),
+            serde_json::json!([
+                null,
+                {
+                    "1": {"logprob": -0.10000000149011612_f64, "rank": 1, "decoded_token": "A"},
+                    "2": {"logprob": -1.0, "rank": 2, "decoded_token": "B"},
+                    "3": {"logprob": -2.0, "rank": 3, "decoded_token": "C"},
+                }
+            ])
+        );
+    }
+
+    fn sample_logprobs() -> DecodedLogprobs {
+        DecodedLogprobs {
+            positions: vec![DecodedPositionLogprobs {
+                entries: vec![
+                    DecodedTokenLogprob {
+                        token_id: 1,
+                        token: "A".to_string(),
+                        logprob: -0.1,
+                        rank: 1,
+                    },
+                    DecodedTokenLogprob {
+                        token_id: 2,
+                        token: "B".to_string(),
+                        logprob: -1.0,
+                        rank: 2,
+                    },
+                    DecodedTokenLogprob {
+                        token_id: 3,
+                        token: "C".to_string(),
+                        logprob: -2.0,
+                        rank: 3,
+                    },
+                ],
+            }],
+        }
+    }
+
+    fn chat_top_logprobs_len(top_logprobs: i32) -> usize {
+        let chat_logprobs =
+            decoded_logprobs_to_openai_chat(&sample_logprobs(), top_logprobs, false)
+                .expect("chat logprobs");
+        chat_logprobs.content.expect("content")[0].top_logprobs.len()
+    }
+
+    #[test]
+    fn chat_logprobs_respects_requested_top_logprobs_count() {
+        assert_eq!(chat_top_logprobs_len(0), 0);
+        assert_eq!(chat_top_logprobs_len(1), 1);
+        assert_eq!(chat_top_logprobs_len(-1), 3);
+    }
+}

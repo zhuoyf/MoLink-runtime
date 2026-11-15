@@ -128,3 +128,85 @@ fn decode_position_logprobs<T: Tokenizer + ?Sized>(
             .try_collect()?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use vllm_llm::{Logprobs, PositionLogprobs, TokenLogprob};
+    use vllm_tokenizer::test_utils::TestTokenizer;
+
+    use super::*;
+
+    #[test]
+    fn decode_logprobs_decodes_every_candidate_token() {
+        let tokenizer = TestTokenizer::new();
+        let logprobs = Logprobs {
+            positions: vec![PositionLogprobs {
+                entries: vec![
+                    TokenLogprob {
+                        token_id: b'a' as u32,
+                        logprob: -0.1,
+                        rank: 3,
+                    },
+                    TokenLogprob {
+                        token_id: b'b' as u32,
+                        logprob: -0.2,
+                        rank: 1,
+                    },
+                ],
+            }],
+        };
+
+        assert_eq!(
+            decode_logprobs(&tokenizer, &logprobs, false).unwrap(),
+            DecodedLogprobs {
+                positions: vec![DecodedPositionLogprobs {
+                    entries: vec![
+                        DecodedTokenLogprob {
+                            token_id: b'a' as u32,
+                            token: "a".to_string(),
+                            logprob: -0.1,
+                            rank: 3,
+                        },
+                        DecodedTokenLogprob {
+                            token_id: b'b' as u32,
+                            token: "b".to_string(),
+                            logprob: -0.2,
+                            rank: 1,
+                        },
+                    ],
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn decode_prompt_logprobs_separates_first_prompt_token() {
+        let tokenizer = TestTokenizer::new();
+        let logprobs = Logprobs {
+            positions: vec![PositionLogprobs {
+                entries: vec![TokenLogprob {
+                    token_id: b'x' as u32,
+                    logprob: -0.4,
+                    rank: 1,
+                }],
+            }],
+        };
+
+        assert_eq!(
+            decode_prompt_logprobs(&tokenizer, &[b'p' as u32, b'x' as u32], &logprobs, false)
+                .unwrap(),
+            DecodedPromptLogprobs {
+                first_token_id: b'p' as u32,
+                first_token: "p".to_string(),
+                scored_positions: vec![DecodedPositionLogprobs {
+                    entries: vec![DecodedTokenLogprob {
+                        token_id: b'x' as u32,
+                        token: "x".to_string(),
+                        logprob: -0.4,
+                        rank: 1,
+                    }],
+                }],
+            }
+        );
+    }
+}

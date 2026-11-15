@@ -187,3 +187,75 @@ impl ChatOutputProcessor for DefaultChatOutputProcessor {
         Ok(structured.boxed())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use vllm_tokenizer::test_utils::TestTokenizer;
+
+    use super::DefaultChatOutputProcessor;
+    use crate::Error;
+    use crate::parser::ParserSelection;
+    use crate::request::ChatRequest;
+
+    fn tokenizer() -> Arc<TestTokenizer> {
+        Arc::new(
+            TestTokenizer::new()
+                .with_regular_token("<|channel>", 256)
+                .with_regular_token("<channel|>", 257),
+        )
+    }
+
+    #[test]
+    fn equal_explicit_gemma4_uses_unified_parser() {
+        let mut request = ChatRequest::for_test();
+        let selection = ParserSelection::Explicit("gemma4".to_string());
+
+        DefaultChatOutputProcessor::new(
+            &mut request,
+            "other-model",
+            tokenizer(),
+            &selection,
+            &selection,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn auto_auto_gemma4_model_uses_unified_parser() {
+        let mut request = ChatRequest::for_test();
+
+        DefaultChatOutputProcessor::new(
+            &mut request,
+            "google/gemma-4-27b-it",
+            tokenizer(),
+            &ParserSelection::Auto,
+            &ParserSelection::Auto,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn mixed_gemma4_selection_uses_split_dummy_error() {
+        let mut request = ChatRequest::for_test();
+        let error = match DefaultChatOutputProcessor::new(
+            &mut request,
+            "other-model",
+            tokenizer(),
+            &ParserSelection::Auto,
+            &ParserSelection::Explicit("gemma4".to_string()),
+        ) {
+            Ok(_) => panic!("expected mixed Gemma4 parser selection to fail"),
+            Err(error) => error,
+        };
+
+        let Error::ParserInitialization { error, .. } = error else {
+            panic!("expected parser initialization error");
+        };
+        assert_eq!(
+            error.to_string(),
+            "`gemma4` only provides a unified parser; the same reasoning parser and tool parser should be specified together"
+        );
+    }
+}

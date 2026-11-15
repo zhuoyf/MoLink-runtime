@@ -112,3 +112,26 @@ impl RequestRuntimeErrorResponse for axum::http::Response<tonic::body::Body> {
 fn should_offload(path: &str) -> bool {
     OFFLOADED_PATHS.contains(&path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::should_offload;
+
+    #[test]
+    fn offloads_generation_and_tokenization_paths() {
+        assert!(should_offload("/v1/chat/completions"));
+        assert!(should_offload("/v1/completions"));
+        assert!(should_offload("/tokenize"));
+        assert!(should_offload("/detokenize"));
+        assert!(should_offload("/inference/v1/generate"));
+        assert!(should_offload("/vllm.Inference/Generate"));
+        assert!(should_offload("/vllm.Inference/GenerateStream"));
+    }
+
+    #[test]
+    fn passes_through_lightweight_paths() {
+        assert!(!should_offload("/health"));
+        assert!(!should_offload("/metrics"));
+        assert!(!should_offload("/v1/models"));
+    }
+}

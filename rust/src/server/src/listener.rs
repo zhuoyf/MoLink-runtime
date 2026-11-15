@@ -272,3 +272,39 @@ impl futures::Stream for MaybeTlsListener {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::os::fd::IntoRawFd;
+
+    use socket2::{Domain, SockAddr, Socket, Type};
+    use uuid::Uuid;
+
+    use super::Listener;
+    use crate::HttpListenerMode;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inherited_fd_detects_tcp_listener_without_uds_hint() {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        socket.bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))).unwrap();
+        let fd = socket.into_raw_fd();
+
+        let listener = Listener::bind(&HttpListenerMode::InheritedFd { fd }).await.unwrap();
+
+        assert!(matches!(listener, Listener::Tcp(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inherited_fd_detects_unix_listener_from_fd() {
+        let path = std::env::temp_dir().join(format!("vllm-rs-{}.sock", Uuid::new_v4()));
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        socket.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+        let fd = socket.into_raw_fd();
+
+        let listener = Listener::bind(&HttpListenerMode::InheritedFd { fd }).await.unwrap();
+
+        assert!(matches!(listener, Listener::Unix(_)));
+        let _ = std::fs::remove_file(path);
+    }
+}

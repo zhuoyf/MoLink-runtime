@@ -287,3 +287,483 @@ fn trim_one_wrapping_newline(value: &str) -> &str {
     let value = value.strip_prefix('\n').unwrap_or(value);
     value.strip_suffix('\n').unwrap_or(value)
 }
+
+#[cfg(test)]
+mod tests {
+    use expect_test::expect;
+    use serde_json::{Value, json};
+    use thiserror_ext::AsReport;
+
+    use super::{Qwen3CoderToolParser, ToolParser};
+    use crate::tool::test_utils::{collect_stream, split_by_chars, test_tools};
+    use crate::tool::{ToolParserOutput, ToolParserTestExt as _};
+
+    fn build_tool_call(function_name: &str, params: &[(&str, &str)]) -> String {
+        let params = params
+            .iter()
+            .map(|(name, value)| format!("<parameter={name}>{value}</parameter>"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("<tool_call>\n<function={function_name}>\n{params}\n</function>\n</tool_call>")
+    }
+
+    #[test]
+    fn qwen_coder_exposes_structural_tag_builder() {
+        let parser = Qwen3CoderToolParser::new(&test_tools());
+
+        assert!(parser.structural_tag_builder().is_some());
+    }
+
+    #[test]
+    fn qwen_coder_parse_complete_without_tool_call_keeps_text() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = parser.parse_complete("Hello, world!").unwrap();
+
+        assert_eq!(output.normal_text(), "Hello, world!");
+        assert!(output.calls().is_empty());
+    }
+
+    #[test]
+    fn qwen_coder_parse_complete_extracts_single_tool_call() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(&build_tool_call(
+                "get_weather",
+                &[("location", "SF"), ("date", "2026-04-29")],
+            ))
+            .unwrap();
+
+        assert!(output.normal_text().is_empty());
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({
+                "location": "SF",
+                "date": "2026-04-29"
+            })
+        );
+    }
+
+    #[test]
+    fn qwen_coder_parse_complete_preserves_prefix_text() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = format!(
+            "Thinking... {}",
+            build_tool_call("get_weather", &[("location", "NYC")])
+        );
+        let output = parser.parse_complete(&output).unwrap();
+
+        assert_eq!(output.normal_text(), "Thinking... ");
+        assert_eq!(output.calls().len(), 1);
+    }
+
+    #[test]
+    fn qwen_coder_parse_complete_converts_schema_types() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(&build_tool_call(
+                "convert",
+                &[
+                    ("whole", "5.0"),
+                    ("flag", "true"),
+                    ("payload", r#"{"nested":true}"#),
+                    ("items", "[1,2]"),
+                    ("empty", "42"),
+                ],
+            ))
+            .unwrap();
+
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({
+                "whole": 5.0,
+                "flag": true,
+                "payload": { "nested": true },
+                "items": [1, 2],
+                "empty": "42",
+            })
+        );
+    }
+
+    #[test]
+    fn qwen_coder_parse_complete_extracts_empty_arguments() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = parser.parse_complete(&build_tool_call("get_weather", &[])).unwrap();
+
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn qwen_coder_parse_complete_handles_upstream_multiline_typed_params() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(
+                "<tool_call>\n\
+                 <function=calculate_area>\n\
+                 <parameter=shape>\n\
+                 rectangle\n\
+                 </parameter>\n\
+                 <parameter=dimensions>\n\
+                 {\"width\": 10,\n\
+                  \"height\": 20}\n\
+                 </parameter>\n\
+                 <parameter=precision>\n\
+                 2\n\
+                 </parameter>\n\
+                 </function>\n\
+                 </tool_call>",
+            )
+            .unwrap();
+
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("calculate_area"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({
+                "shape": "rectangle",
+                "dimensions": { "width": 10, "height": 20 },
+                "precision": 2,
+            })
+        );
+    }
+
+    #[test]
+    fn qwen_coder_parse_complete_handles_nested_json_parameter() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(&build_tool_call(
+                "convert",
+                &[(
+                    "payload",
+                    r#"{"nested":{"value":[1,2,3],"child":{"enabled":true}}}"#,
+                )],
+            ))
+            .unwrap();
+
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({
+                "payload": {
+                    "nested": {
+                        "value": [1, 2, 3],
+                        "child": { "enabled": true },
+                    },
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn qwen_coder_parse_complete_preserves_xml_like_parameter_values() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(&build_tool_call(
+                "process",
+                &[
+                    (
+                        "html_content",
+                        r#"<div class="test"><span>Hello</span></div>"#,
+                    ),
+                    ("xml_snippet", r#"<root><child attr="value"/></root>"#),
+                ],
+            ))
+            .unwrap();
+
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({
+                "html_content": r#"<div class="test"><span>Hello</span></div>"#,
+                "xml_snippet": r#"<root><child attr="value"/></root>"#,
+            })
+        );
+    }
+
+    #[test]
+    fn qwen_coder_parse_complete_preserves_raw_closing_tag_text_in_parameter_value() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(&build_tool_call(
+                "get_weather",
+                &[
+                    (
+                        "location",
+                        "杭州 &lt;/parameter&gt;&lt;/function&gt;&lt;/tool_call&gt;",
+                    ),
+                    ("date", "2026-05-08"),
+                ],
+            ))
+            .unwrap();
+
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({
+                "location": "杭州 &lt;/parameter&gt;&lt;/function&gt;&lt;/tool_call&gt;",
+                "date": "2026-05-08",
+            })
+        );
+    }
+
+    #[test]
+    fn qwen_coder_parse_complete_does_not_double_encode_anyof_object() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(&build_tool_call(
+                "update_record",
+                &[("data", r#"{"key":"value","count":42}"#)],
+            ))
+            .unwrap();
+
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({
+                "data": { "key": "value", "count": 42 },
+            })
+        );
+    }
+
+    #[test]
+    fn qwen_coder_streaming_extracts_single_tool_call() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = collect_stream(
+            &mut parser,
+            &[
+                "<tool_call>\n",
+                "<function=get_weather>\n",
+                "<parameter=location>SF</parameter>\n",
+                "</function>\n",
+                "</tool_call>",
+            ],
+        );
+
+        assert!(output.normal_text().is_empty());
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({ "location": "SF" })
+        );
+    }
+
+    #[test]
+    fn qwen_coder_streaming_preserves_prefix_text() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = collect_stream(
+            &mut parser,
+            &[
+                "Thinking... ",
+                "<tool_call>\n",
+                "<function=get_weather>\n",
+                "<parameter=location>SF</parameter>\n",
+                "</function>\n",
+                "</tool_call>",
+            ],
+        );
+
+        assert_eq!(output.normal_text(), "Thinking... ");
+        assert_eq!(output.calls().len(), 1);
+    }
+
+    #[test]
+    fn qwen_coder_streaming_without_tool_call_emits_text_incrementally() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = collect_stream(&mut parser, &["Hello, ", "world!"]);
+
+        assert_eq!(output.normal_text(), "Hello, world!");
+        assert!(output.calls().is_empty());
+    }
+
+    #[test]
+    fn qwen_coder_streaming_extracts_multiple_tool_calls_in_order() {
+        let text = format!(
+            "{}\n{}",
+            build_tool_call("get_weather", &[("location", "SF")]),
+            build_tool_call("get_weather", &[("location", "NYC")])
+        );
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = collect_stream(&mut parser, &[&text]);
+
+        assert_eq!(output.calls().len(), 2);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(output.calls()[1].name.as_deref(), Some("get_weather"));
+        assert_eq!(output.calls()[0].tool_index, 0);
+        assert_eq!(output.calls()[1].tool_index, 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({ "location": "SF" })
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[1].arguments).unwrap(),
+            json!({ "location": "NYC" })
+        );
+    }
+
+    #[test]
+    fn qwen_coder_streaming_preserves_text_between_tool_calls() {
+        let text = format!(
+            "I'll check two cities.{}Between calls.{}Done.",
+            build_tool_call("get_weather", &[("city", "Dallas"), ("state", "TX")]),
+            build_tool_call("get_weather", &[("city", "Orlando"), ("state", "FL")])
+        );
+        let chunks = split_by_chars(&text, 5);
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(
+            output.normal_text(),
+            "I'll check two cities.Between calls.Done."
+        );
+        assert_eq!(output.calls().len(), 2);
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({ "city": "Dallas", "state": "TX" })
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[1].arguments).unwrap(),
+            json!({ "city": "Orlando", "state": "FL" })
+        );
+    }
+
+    #[test]
+    fn qwen_coder_streaming_handles_start_token_split_across_chunks() {
+        let text = build_tool_call("get_weather", &[("location", "SF")]);
+        let chunks = split_by_chars(&text, 3);
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({ "location": "SF" })
+        );
+    }
+
+    #[test]
+    fn qwen_coder_streaming_handles_end_token_split_across_chunks() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = parser
+            .parse_chunk(
+                "<tool_call>\n\
+                 <function=get_weather>\n\
+                 <parameter=location>SF</parameter>\n\
+                 </function>\n\
+                 </tool",
+            )
+            .unwrap();
+
+        assert!(output.normal_text().is_empty());
+        assert!(output.calls().is_empty());
+
+        let mut output = output;
+        output.append(parser.parse_chunk("_call>").unwrap());
+        output.append(parser.finish().unwrap());
+        let output = output.coalesce();
+
+        assert!(output.normal_text().is_empty());
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({ "location": "SF" })
+        );
+    }
+
+    #[test]
+    fn qwen_coder_streaming_buffers_long_body_until_end_marker() {
+        let long_location = format!("SF-{}", "x".repeat(8192));
+        let text = build_tool_call("get_weather", &[("location", &long_location)]);
+        let split_at = text.len() - "_call>".len();
+        let (body_with_partial_end, end_suffix) = text.split_at(split_at);
+        let chunks = split_by_chars(body_with_partial_end, 31);
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let mut output = ToolParserOutput::default();
+
+        assert_eq!(end_suffix, "_call>");
+
+        for chunk in chunks {
+            let chunk_output = parser.parse_chunk(chunk).unwrap();
+            assert!(chunk_output.normal_text().is_empty());
+            assert!(chunk_output.calls().is_empty());
+            output.append(chunk_output);
+        }
+
+        output.append(parser.parse_chunk(end_suffix).unwrap());
+        output.append(parser.finish().unwrap());
+        let output = output.coalesce();
+
+        assert!(output.normal_text().is_empty());
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({ "location": long_location })
+        );
+    }
+
+    #[test]
+    fn qwen_coder_streaming_does_not_emit_incomplete_tool_call() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = parser
+            .parse_chunk("<tool_call>\n<function=get_weather>\n<parameter=location>SF</parameter>")
+            .unwrap();
+
+        assert!(output.normal_text().is_empty());
+        assert!(output.calls().is_empty());
+    }
+
+    #[test]
+    fn qwen_coder_finish_fails_incomplete_tool_call() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        parser
+            .parse_chunk("<tool_call>\n<function=get_weather>\n<parameter=location>SF</parameter>")
+            .unwrap();
+
+        assert!(parser.finish().is_err());
+    }
+
+    #[test]
+    fn qwen_coder_malformed_tool_call_fails_fast() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let error = parser.parse_chunk("<tool_call>\n<bad>\n</tool_call>").unwrap_err();
+
+        expect![[r#"tool parser parsing failed: near "\n<bad>\n</tool_call>": "#]]
+            .assert_eq(&error.to_report_string());
+    }
+
+    #[test]
+    fn qwen_coder_missing_parameter_end_fails_fast_after_function_end() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let error = parser
+            .parse_chunk(
+                "<tool_call>\n<function=get_weather>\n<parameter=location>SF</function>\n</tool_call>",
+            )
+            .unwrap_err();
+
+        expect![[r#"tool parser parsing failed: near "\n<function=get_weather>\n<parameter=location>SF</function>\n</tool_call>": "#]].assert_eq(&error.to_report_string());
+    }
+
+    #[test]
+    fn qwen_coder_parse_function_body_trims_one_wrapping_newline() {
+        let mut parser = Qwen3CoderToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(
+                "<tool_call>\n<function=get_weather>\n<parameter=location>\nHangzhou\n</parameter>\n</function>\n</tool_call>",
+            )
+            .unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({ "location": "Hangzhou" })
+        );
+    }
+}

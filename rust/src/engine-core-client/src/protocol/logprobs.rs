@@ -2,6 +2,8 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 mod array;
+#[cfg(test)]
+mod tests;
 mod wire;
 
 use std::ops::{Deref, DerefMut};

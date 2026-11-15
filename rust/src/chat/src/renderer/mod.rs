@@ -17,6 +17,8 @@ pub mod hf;
 mod inkling;
 mod kimi_k3;
 mod selection;
+#[cfg(test)]
+mod test_utils;
 
 pub use deepseek_v4::DeepSeekV4ChatRenderer;
 pub use deepseek_v32::DeepSeekV32ChatRenderer;

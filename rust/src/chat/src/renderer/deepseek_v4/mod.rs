@@ -29,3 +29,6 @@ impl ChatRenderer for DeepSeekV4ChatRenderer {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

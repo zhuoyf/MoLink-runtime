@@ -136,3 +136,25 @@ pub async fn detokenize(
         Err(e) => server_error!("detokenize failed: {}", e.to_report_string()).into_response(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::http::{HeaderMap, HeaderValue};
+
+    use super::tokenize_request_id;
+
+    #[test]
+    fn tokenize_request_id_prefers_x_request_id_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Request-Id", HeaderValue::from_static("client-req-1"));
+        assert_eq!(tokenize_request_id(&headers), "tokenize-client-req-1");
+    }
+
+    #[test]
+    fn tokenize_request_id_generates_uuid_when_header_missing() {
+        let headers = HeaderMap::new();
+        let id = tokenize_request_id(&headers);
+        assert!(id.starts_with("tokenize-"));
+        assert_ne!(id, "tokenize-");
+    }
+}

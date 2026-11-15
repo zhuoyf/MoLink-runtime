@@ -4,6 +4,8 @@
 //! Native Kimi K3 XTML chat renderer.
 
 mod encoding;
+#[cfg(test)]
+mod tests;
 
 use vllm_text::Prompt;
 use vllm_text::tokenizer::DynTokenizer;

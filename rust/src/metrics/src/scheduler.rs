@@ -360,3 +360,65 @@ impl SchedulerMetrics {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::{CudagraphLogKey, EngineLabels, Metrics, SchedulerLogStatsAccumulator};
+
+    #[test]
+    fn perf_counters_render_with_a_single_total_suffix() {
+        let metrics = Metrics::new();
+        let labels = EngineLabels {
+            model_name: "model".to_string(),
+            engine: 0,
+        };
+
+        metrics.scheduler.estimated_flops_per_gpu.get_or_create(&labels).inc();
+        metrics.scheduler.estimated_read_bytes_per_gpu.get_or_create(&labels).inc();
+        metrics.scheduler.estimated_write_bytes_per_gpu.get_or_create(&labels).inc();
+
+        let rendered = metrics.render().unwrap();
+        assert!(
+            rendered.contains(
+                "vllm:estimated_flops_per_gpu_total{model_name=\"model\",engine=\"0\"} 1"
+            )
+        );
+        assert!(rendered.contains(
+            "vllm:estimated_read_bytes_per_gpu_total{model_name=\"model\",engine=\"0\"} 1"
+        ));
+        assert!(rendered.contains(
+            "vllm:estimated_write_bytes_per_gpu_total{model_name=\"model\",engine=\"0\"} 1"
+        ));
+        assert!(!rendered.contains("vllm:estimated_flops_per_gpu_total_total"));
+        assert!(!rendered.contains("vllm:estimated_read_bytes_per_gpu_total_total"));
+        assert!(!rendered.contains("vllm:estimated_write_bytes_per_gpu_total_total"));
+    }
+
+    #[test]
+    fn log_stats_accumulator_drains_interval_data() {
+        let accumulator = SchedulerLogStatsAccumulator::default();
+
+        accumulator.observe_spec_decode(2, &[1, 2]);
+        accumulator.observe_spec_decode(3, &[3, 4, 5]);
+        accumulator.observe_cudagraph(8, 16, 8, "FULL");
+        accumulator.observe_cudagraph(8, 16, 8, "FULL");
+
+        let interval = accumulator.drain();
+
+        assert_eq!(interval.spec_num_drafts, 5);
+        assert_eq!(interval.spec_accepted_tokens_per_pos, vec![4, 6, 5]);
+        assert_eq!(
+            interval
+                .cudagraph_counts
+                .get(&CudagraphLogKey {
+                    num_unpadded_tokens: 8,
+                    num_padded_tokens: 16,
+                    num_paddings: 8,
+                    runtime_mode: "FULL".to_string(),
+                })
+                .copied(),
+            Some(2)
+        );
+        assert_eq!(accumulator.drain().spec_num_drafts, 0);
+    }
+}

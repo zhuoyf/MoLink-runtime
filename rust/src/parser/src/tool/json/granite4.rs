@@ -302,3 +302,256 @@ fn close_event(input: &mut JsonToolInput<'_>) -> ModalResult<Granite4Event> {
         .value(Granite4Event::ToolCallEnd)
         .parse_next(input)
 }
+
+#[cfg(test)]
+mod tests {
+    use expect_test::expect;
+    use thiserror_ext::AsReport;
+
+    use super::Granite4ToolParser;
+    use crate::tool::test_utils::{collect_stream, split_by_chars, test_tools};
+    use crate::tool::{ToolParser, ToolParserOutput, ToolParserTestExt as _};
+
+    #[test]
+    fn granite4_parse_complete_without_tool_call_keeps_text() {
+        let mut parser = Granite4ToolParser::new(&test_tools());
+        let output = parser.parse_complete("Hello, world!").unwrap();
+
+        assert_eq!(output.normal_text(), "Hello, world!");
+        assert!(output.calls().is_empty());
+    }
+
+    #[test]
+    fn granite4_parse_complete_object_args() {
+        let mut parser = Granite4ToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(
+                r#"<tool_call>{"name":"get_weather","arguments":{"city":"Boston"}}</tool_call>"#,
+            )
+            .unwrap();
+
+        assert_eq!(output.normal_text(), "");
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(output.calls()[0].arguments, r#"{"city":"Boston"}"#);
+    }
+
+    #[test]
+    fn granite4_parse_complete_string_args() {
+        // GRANITE4-SPECIFIC: `arguments` may be a pre-serialized JSON string; its
+        // decoded contents become the arguments.
+        let mut parser = Granite4ToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(
+                r#"<tool_call>{"name":"get_weather","arguments":"{\"city\":\"Boston\"}"}</tool_call>"#,
+            )
+            .unwrap();
+
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(output.calls()[0].arguments, r#"{"city":"Boston"}"#);
+    }
+
+    #[test]
+    fn granite4_extracts_interleaved_content_and_mixed_args() {
+        let mut parser = Granite4ToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(
+                r#"before <tool_call>{"name":"find_bbox","arguments":"{\"x\":1}"}</tool_call> middle <tool_call>{"name":"get_weather","arguments":{"city":"Boston"}}</tool_call> after"#,
+            )
+            .unwrap();
+
+        expect![[r#"
+            ToolParserOutput {
+                events: [
+                    Text(
+                        "before  middle  after",
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 0,
+                            name: Some(
+                                "find_bbox",
+                            ),
+                            arguments: "{\"x\":1}",
+                        },
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 1,
+                            name: Some(
+                                "get_weather",
+                            ),
+                            arguments: "{\"city\":\"Boston\"}",
+                        },
+                    ),
+                ],
+            }
+        "#]]
+        .assert_debug_eq(&output);
+    }
+
+    #[test]
+    fn granite4_streaming_handles_split_markers() {
+        let input = r#"hello <tool_call>{"name":"get_weather","arguments":{"city":"Tokyo"}}</tool_call> bye"#;
+        let chunks = split_by_chars(input, 5);
+        let mut parser = Granite4ToolParser::new(&test_tools());
+
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(output.normal_text(), "hello  bye");
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(output.calls()[0].arguments, r#"{"city":"Tokyo"}"#);
+    }
+
+    #[test]
+    fn granite4_streaming_emits_object_argument_deltas() {
+        let mut parser = Granite4ToolParser::new(&test_tools());
+        let chunks = [
+            r#"<tool_call>{"name":"get_weather","arguments":"#,
+            r#"{"city":"#,
+            r#""Beijing""#,
+            r#"}"#,
+            r#"}</tool_call>"#,
+        ];
+
+        let mut output = ToolParserOutput::default();
+        let mut observed_arguments = Vec::new();
+        for chunk in chunks {
+            let next = parser.parse_chunk(chunk).unwrap();
+            observed_arguments.extend(
+                next.calls()
+                    .iter()
+                    .filter(|call| call.name.is_none())
+                    .map(|call| call.arguments.clone()),
+            );
+            output.append(next);
+        }
+        output.append(parser.finish().unwrap());
+
+        assert_eq!(observed_arguments, [r#"{"city":"#, r#""Beijing""#, r#"}"#]);
+        assert_eq!(
+            output.coalesce().calls()[0].arguments,
+            r#"{"city":"Beijing"}"#
+        );
+    }
+
+    #[test]
+    fn granite4_string_args_split_across_chunks() {
+        let input = r#"<tool_call>{"name":"f","arguments":"{\"a\":1}"}</tool_call>"#;
+        let chunks = split_by_chars(input, 3);
+        let mut parser = Granite4ToolParser::new(&test_tools());
+
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("f"));
+        assert_eq!(output.calls()[0].arguments, r#"{"a":1}"#);
+    }
+
+    #[test]
+    fn granite4_long_string_args_stream_without_reparse() {
+        let arguments = format!(r#"{{"data":"{}"}}"#, "x".repeat(64 * 1024));
+        let encoded_arguments = serde_json::to_string(&arguments).unwrap();
+        let input =
+            format!(r#"<tool_call>{{"name":"f","arguments":{encoded_arguments}}}</tool_call>"#);
+        let chunks = split_by_chars(&input, 7);
+        let mut parser = Granite4ToolParser::new(&test_tools());
+
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("f"));
+        assert_eq!(output.calls()[0].arguments, arguments);
+    }
+
+    #[test]
+    fn granite4_streaming_handles_marker_and_json_whitespace() {
+        // Granite spaces the markers (`<tool_call> {…} </tool_call>`) and the JSON
+        // (`"name": …`). Since `args_event` has no leading `ws0`, this guards that
+        // the header consumes the whitespace before the arguments value.
+        let input = concat!(
+            "Here goes the bbox call: \n",
+            r#"<tool_call> {"name": "find_bbox", "arguments": "{\"coordinates\": [[23.54, 43.1], [-12.2, 54.3], [4, 5]], \"coordinate_type\": \"latlong\"}"} </tool_call>"#,
+            " Now the stock price call: \n ",
+            r#"<tool_call> {"name": "get_stock_price", "arguments": {"symbol": "AAPL", "start_date": "2021-01-01", "end_date": "2021-12-31"}} </tool_call>"#,
+            " Now another bbox call: \n ",
+            r#"<tool_call> {"name": "find_bbox", "arguments": "{\"coordinates\": [[23.54, 43.1], [-12.2, 54.3], [4, 5]], \"coordinate_type\": \"latlong\"}"} </tool_call>"#,
+            " See? I'm a helpful assistant.",
+        );
+        let chunks = split_by_chars(input, 3);
+        let mut parser = Granite4ToolParser::new(&test_tools());
+
+        let output = collect_stream(&mut parser, &chunks);
+
+        expect![[r#"
+            ToolParserOutput {
+                events: [
+                    Text(
+                        "Here goes the bbox call: \n Now the stock price call: \n  Now another bbox call: \n  See? I'm a helpful assistant.",
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 0,
+                            name: Some(
+                                "find_bbox",
+                            ),
+                            arguments: "{\"coordinates\": [[23.54, 43.1], [-12.2, 54.3], [4, 5]], \"coordinate_type\": \"latlong\"}",
+                        },
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 1,
+                            name: Some(
+                                "get_stock_price",
+                            ),
+                            arguments: "{\"symbol\": \"AAPL\", \"start_date\": \"2021-01-01\", \"end_date\": \"2021-12-31\"}",
+                        },
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 2,
+                            name: Some(
+                                "find_bbox",
+                            ),
+                            arguments: "{\"coordinates\": [[23.54, 43.1], [-12.2, 54.3], [4, 5]], \"coordinate_type\": \"latlong\"}",
+                        },
+                    ),
+                ],
+            }
+        "#]].assert_debug_eq(&output);
+    }
+
+    #[test]
+    fn granite4_finish_fails_incomplete_tool_call() {
+        let mut parser = Granite4ToolParser::new(&test_tools());
+        parser
+            .parse_chunk(r#"<tool_call>{"name":"get_weather","arguments":{"city""#)
+            .unwrap();
+
+        let error = parser.finish().unwrap_err();
+
+        expect!["tool parser parsing failed: incomplete Granite4 tool call"]
+            .assert_eq(&error.to_report_string());
+    }
+
+    #[test]
+    fn granite4_rejects_non_object_non_string_args() {
+        let mut parser = Granite4ToolParser::new(&test_tools());
+        let error = parser
+            .parse_chunk(r#"<tool_call>{"name":"f","arguments":42}</tool_call>"#)
+            .unwrap_err();
+
+        expect![[
+            r#"tool parser parsing failed: near "42}</tool_call>": invalid Granite4 arguments"#
+        ]]
+        .assert_eq(&error.to_report_string());
+    }
+
+    #[test]
+    fn granite4_preserve_special_tokens_is_false() {
+        let parser = Granite4ToolParser::new(&test_tools());
+        assert!(!parser.preserve_special_tokens());
+    }
+}

@@ -267,3 +267,336 @@ fn partial_attr_value<'i>(input: &mut MinimaxM2Input<'i>) -> ModalResult<&'i str
 fn ignored_rest_event(input: &mut MinimaxM2Input<'_>) -> ModalResult<MinimaxM2Event> {
     rest.value(MinimaxM2Event::IgnoredRest).parse_next(input)
 }
+
+#[cfg(test)]
+mod tests {
+    use expect_test::expect;
+    use serde_json::{Value, json};
+    use thiserror_ext::AsReport;
+
+    use super::{MinimaxM2ToolParser, TOOL_CALL_END, TOOL_CALL_START, ToolParser};
+    use crate::tool::ToolParserTestExt as _;
+    use crate::tool::test_utils::{collect_stream, split_by_chars, test_tools};
+
+    fn build_tool_block(invokes: &[(&str, Vec<(&str, &str)>)]) -> String {
+        let invokes = invokes
+            .iter()
+            .map(|(function_name, params)| {
+                let params = params
+                    .iter()
+                    .map(|(name, value)| format!(r#"<parameter name="{name}">{value}</parameter>"#))
+                    .collect::<Vec<_>>()
+                    .join("");
+                format!(r#"<invoke name="{function_name}">{params}</invoke>"#)
+            })
+            .collect::<String>();
+        format!("{TOOL_CALL_START}{invokes}{TOOL_CALL_END}")
+    }
+
+    #[test]
+    fn minimax_m2_parse_complete_without_tool_call_keeps_text() {
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let output = parser.parse_complete("Hello, world!").unwrap();
+
+        assert_eq!(output.normal_text(), "Hello, world!");
+        assert!(output.calls().is_empty());
+    }
+
+    #[test]
+    fn minimax_m2_parse_complete_extracts_single_tool_call() {
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(&build_tool_block(&[(
+                "get_weather",
+                vec![("city", "Seattle"), ("days", "5")],
+            )]))
+            .unwrap();
+
+        assert!(output.normal_text().is_empty());
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({ "city": "Seattle", "days": 5 })
+        );
+    }
+
+    #[test]
+    fn minimax_m2_parse_complete_preserves_prefix_and_ignores_trailing_text() {
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let output = format!(
+            "Let me check. {} This trailing text is ignored.",
+            build_tool_block(&[("get_weather", vec![("city", "Seattle")])])
+        );
+        let output = parser.parse_complete(&output).unwrap();
+
+        assert_eq!(output.normal_text(), "Let me check. ");
+        assert_eq!(output.calls().len(), 1);
+    }
+
+    #[test]
+    fn minimax_m2_parse_complete_extracts_multiple_invokes() {
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(&build_tool_block(&[
+                ("get_weather", vec![("city", "Seattle")]),
+                ("get_weather", vec![("city", "NYC")]),
+            ]))
+            .unwrap();
+
+        assert_eq!(output.calls().len(), 2);
+        assert_eq!(output.calls()[0].tool_index, 0);
+        assert_eq!(output.calls()[1].tool_index, 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({ "city": "Seattle" })
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[1].arguments).unwrap(),
+            json!({ "city": "NYC" })
+        );
+    }
+
+    #[test]
+    fn minimax_m2_parse_complete_converts_schema_types() {
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(&build_tool_block(&[(
+                "convert",
+                vec![
+                    ("whole", "5.0"),
+                    ("flag", "true"),
+                    ("payload", r#"{"nested":true}"#),
+                    ("items", "[1,2]"),
+                    ("empty", "42"),
+                ],
+            )]))
+            .unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({
+                "whole": 5.0,
+                "flag": true,
+                "payload": { "nested": true },
+                "items": [1, 2],
+                "empty": "42",
+            })
+        );
+    }
+
+    #[test]
+    fn minimax_m2_parse_complete_preserves_raw_entities_in_parameter_value() {
+        // The MiniMax-M2 chat template renders string parameter values RAW (no
+        // XML escaping), so a value the user wants to be the literal text
+        // "Tom &amp; Jerry &lt;3" is emitted verbatim. The parser must preserve
+        // it; xml_unescape currently decodes it, corrupting the bytes.
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(&build_tool_block(&[(
+                "get_weather",
+                vec![("city", "Tom &amp; Jerry &lt;3")],
+            )]))
+            .unwrap();
+        let args: Value = serde_json::from_str(&output.calls()[0].arguments).unwrap();
+        assert_eq!(args["city"], json!("Tom &amp; Jerry &lt;3"));
+    }
+
+    #[test]
+    fn minimax_m2_parse_complete_preserves_raw_closing_tag_text_in_parameter_value() {
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(&build_tool_block(&[(
+                "get_weather",
+                vec![
+                    (
+                        "city",
+                        "Seattle &lt;/parameter&gt;&lt;/invoke&gt;&lt;/minimax:tool_call&gt;",
+                    ),
+                    ("days", "5"),
+                ],
+            )]))
+            .unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({
+                "city": "Seattle &lt;/parameter&gt;&lt;/invoke&gt;&lt;/minimax:tool_call&gt;",
+                "days": 5,
+            })
+        );
+    }
+
+    #[test]
+    fn minimax_m2_parse_complete_handles_multiline_parameters() {
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let output = parser
+            .parse_complete(
+                "<minimax:tool_call>\
+                 <invoke name=\"calculate_area\">\
+                 <parameter name=\"shape\">\nrectangle\n</parameter>\
+                 <parameter name=\"dimensions\">{\"width\":10,\n\"height\":20}</parameter>\
+                 <parameter name=\"precision\">2</parameter>\
+                 </invoke>\
+                 </minimax:tool_call>",
+            )
+            .unwrap();
+
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({
+                "shape": "\nrectangle\n",
+                "dimensions": { "width": 10, "height": 20 },
+                "precision": 2,
+            })
+        );
+    }
+
+    #[test]
+    fn minimax_m2_streaming_extracts_single_tool_call() {
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let output = collect_stream(
+            &mut parser,
+            &[
+                "<minimax:tool_call>",
+                r#"<invoke name="get_weather">"#,
+                r#"<parameter name="city">Seattle</parameter>"#,
+                "</invoke></minimax:tool_call>",
+            ],
+        );
+
+        assert!(output.normal_text().is_empty());
+        assert_eq!(output.calls().len(), 1);
+        assert_eq!(output.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            serde_json::from_str::<Value>(&output.calls()[0].arguments).unwrap(),
+            json!({ "city": "Seattle" })
+        );
+    }
+
+    #[test]
+    fn minimax_m2_streaming_preserves_prefix_text() {
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let output = collect_stream(
+            &mut parser,
+            &[
+                "Let me check. ",
+                "<minimax:tool_call>",
+                r#"<invoke name="get_weather"><parameter name="city">Seattle</parameter></invoke>"#,
+                "</minimax:tool_call>",
+            ],
+        );
+
+        assert_eq!(output.normal_text(), "Let me check. ");
+        assert_eq!(output.calls().len(), 1);
+    }
+
+    #[test]
+    fn minimax_m2_streaming_without_tool_call_emits_text_incrementally() {
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let output = collect_stream(&mut parser, &["Hello, ", "world!"]);
+
+        assert_eq!(output.normal_text(), "Hello, world!");
+        assert!(output.calls().is_empty());
+    }
+
+    #[test]
+    fn minimax_m2_streaming_handles_marker_split_across_chunks() {
+        let text = build_tool_block(&[("get_weather", vec![("city", "Seattle")])]);
+        let chunks = split_by_chars(&text, 3);
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(output.calls().len(), 1);
+        assert!(output.normal_text().is_empty());
+    }
+
+    #[test]
+    fn minimax_m2_streaming_extracts_multiple_invokes_in_order() {
+        let text = build_tool_block(&[
+            ("get_weather", vec![("city", "Seattle")]),
+            ("get_weather", vec![("city", "NYC")]),
+        ]);
+        let chunks = split_by_chars(&text, 7);
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(output.calls().len(), 2);
+        assert_eq!(output.calls()[0].tool_index, 0);
+        assert_eq!(output.calls()[1].tool_index, 1);
+    }
+
+    #[test]
+    fn minimax_m2_streaming_handles_template_whitespace_and_split_parameters() {
+        let text = concat!(
+            "I will call the tools.\n",
+            "<minimax:tool_call>\n",
+            "<invoke name=\"get_weather\">\n",
+            "<parameter name=\"city\">Seattle</parameter>\n",
+            "</invoke>\n",
+            "<invoke name=\"get_weather\">\n",
+            "<parameter name=\"city\">NYC</parameter>\n",
+            "</invoke>\n",
+            "</minimax:tool_call>",
+        );
+        let chunks = split_by_chars(text, 7);
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let result = collect_stream(&mut parser, &chunks);
+
+        assert_eq!(result.normal_text(), "I will call the tools.\n");
+        assert_eq!(result.calls().len(), 2);
+        assert_eq!(result.calls()[0].tool_index, 0);
+        assert_eq!(result.calls()[0].name.as_deref(), Some("get_weather"));
+        assert_eq!(result.calls()[1].tool_index, 1);
+        assert_eq!(result.calls()[1].name.as_deref(), Some("get_weather"));
+    }
+
+    #[test]
+    fn minimax_m2_streaming_ignores_text_after_tool_block() {
+        let text = format!(
+            "{} ignored",
+            build_tool_block(&[("get_weather", vec![("city", "Seattle")])])
+        );
+        let chunks = split_by_chars(&text, 5);
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let output = collect_stream(&mut parser, &chunks);
+
+        assert!(output.normal_text().is_empty());
+        assert_eq!(output.calls().len(), 1);
+    }
+
+    #[test]
+    fn minimax_m2_streaming_does_not_emit_incomplete_tool_call() {
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let output =
+            parser.parse_chunk(r#"<minimax:tool_call><invoke name="get_weather">"#).unwrap();
+
+        assert!(output.normal_text().is_empty());
+        assert!(output.calls().is_empty());
+    }
+
+    #[test]
+    fn minimax_m2_finish_fails_incomplete_tool_call() {
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        parser.parse_chunk(r#"<minimax:tool_call><invoke name="get_weather">"#).unwrap();
+
+        assert!(parser.finish().is_err());
+    }
+
+    #[test]
+    fn minimax_m2_finish_fails_after_bare_tool_block_start() {
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        parser.parse_chunk("<minimax:tool_call>").unwrap();
+
+        assert!(parser.finish().is_err());
+    }
+
+    #[test]
+    fn minimax_m2_malformed_tool_call_fails_fast() {
+        let mut parser = MinimaxM2ToolParser::new(&test_tools());
+        let error = parser.parse_chunk("<minimax:tool_call><bad></minimax:tool_call>").unwrap_err();
+
+        expect![[r#"tool parser parsing failed: near "<bad></minimax:tool_call>": "#]]
+            .assert_eq(&error.to_report_string());
+    }
+}

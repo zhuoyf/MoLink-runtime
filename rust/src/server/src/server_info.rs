@@ -89,3 +89,59 @@ fn collect_system_env() -> BTreeMap<String, String> {
         ("os".to_string(), std::env::consts::OS.to_string()),
     ])
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use serde_json::{Value, json};
+
+    use super::{is_public_vllm_env_key, render_config_text};
+
+    #[test]
+    fn render_config_text_formats_config_snapshot() {
+        let rendered = render_config_text(&json!({
+            "model": "test-model",
+            "served_model_name": ["served-model"],
+            "chat_template": null,
+            "enable_log_requests": true,
+        }));
+        let lines = rendered.lines().collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            lines,
+            BTreeSet::from([
+                "chat_template=None",
+                "enable_log_requests=true",
+                "model=test-model",
+                "served_model_name=[\"served-model\"]",
+            ])
+        );
+        assert_eq!(
+            render_config_text(&Value::String("inline".to_string())),
+            "inline"
+        );
+        assert_eq!(render_config_text(&Value::Null), "None");
+    }
+
+    #[test]
+    fn server_info_env_filter_excludes_sensitive_vllm_keys() {
+        for key in [
+            "VLLM_API_KEY",
+            "VLLM_AUTH_TOKEN",
+            "VLLM_SECRET",
+            "VLLM_PASSWORD",
+            "VLLM_CREDENTIAL_FILE",
+            "vllm_token",
+        ] {
+            assert!(!is_public_vllm_env_key(key), "{key}");
+        }
+    }
+
+    #[test]
+    fn server_info_env_filter_includes_public_vllm_keys() {
+        assert!(is_public_vllm_env_key("VLLM_LOGGING_LEVEL"));
+        assert!(is_public_vllm_env_key("VLLM_USE_MODELSCOPE"));
+        assert!(!is_public_vllm_env_key("OTHER_ENV"));
+    }
+}

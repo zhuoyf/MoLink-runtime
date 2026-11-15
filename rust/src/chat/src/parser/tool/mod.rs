@@ -184,3 +184,6 @@ impl ToolParserFactory {
         self.create(name, tools)
     }
 }
+
+#[cfg(test)]
+mod tests;

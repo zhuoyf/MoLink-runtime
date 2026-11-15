@@ -552,3 +552,532 @@ fn done_sse_event() -> Event {
     trace!("completion emitting done");
     Event::default().data("[DONE]")
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use futures::{StreamExt as _, stream};
+    use itertools::Itertools as _;
+    use vllm_engine_core_client::protocol::output::StopReason;
+    use vllm_text::{
+        DecodedLogprobs, DecodedPositionLogprobs, DecodedPromptLogprobs, DecodedTextEvent,
+        DecodedTokenLogprob, FinishReason, Finished,
+    };
+
+    use super::{
+        ApiServerOptions, CompletionSseChunk, CompletionStreamResponse, ResponseOptions,
+        StreamResponseEnvelope, completion_chunk_stream, final_chunk,
+    };
+
+    fn stream_envelope() -> Arc<StreamResponseEnvelope> {
+        Arc::new(StreamResponseEnvelope::new(
+            "cmpl-1".to_string(),
+            "text_completion",
+            1,
+            "model".to_string(),
+        ))
+    }
+
+    fn chunk_response(chunk: &CompletionSseChunk) -> &CompletionStreamResponse {
+        match chunk {
+            CompletionSseChunk::Chunk(response) | CompletionSseChunk::Usage(response) => response,
+        }
+    }
+
+    #[test]
+    fn final_chunk_maps_stop_finish_reason() {
+        let chunk =
+            final_chunk(&stream_envelope(), FinishReason::stop_eos()).expect("finish reason valid");
+        assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(chunk.choices[0].text, "");
+    }
+
+    #[test]
+    fn final_chunk_maps_length_finish_reason() {
+        let chunk =
+            final_chunk(&stream_envelope(), FinishReason::Length).expect("finish reason valid");
+        assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
+    }
+
+    #[test]
+    fn final_chunk_maps_abort_finish_reason() {
+        let chunk =
+            final_chunk(&stream_envelope(), FinishReason::Abort).expect("finish reason valid");
+        assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("abort"));
+    }
+
+    #[test]
+    fn final_chunk_rejects_error_finish_reason() {
+        assert!(final_chunk(&stream_envelope(), FinishReason::Error).is_err());
+    }
+
+    #[tokio::test]
+    async fn completion_chunk_stream_maps_streaming_logprobs() {
+        let stream = stream::iter(vec![
+            Ok(DecodedTextEvent::Start {
+                prompt_token_ids: vec![1, 2, 3, 4, 5].into(),
+                prompt_logprobs: None,
+            }),
+            Ok(DecodedTextEvent::TextDelta {
+                delta: "h".to_string(),
+                token_ids: vec![b'h' as u32],
+                logprobs: Some(DecodedLogprobs {
+                    positions: vec![DecodedPositionLogprobs {
+                        entries: vec![
+                            DecodedTokenLogprob {
+                                token_id: 0,
+                                token: "h".to_string(),
+                                logprob: -0.1,
+                                rank: 1,
+                            },
+                            DecodedTokenLogprob {
+                                token_id: 0,
+                                token: "H".to_string(),
+                                logprob: -0.2,
+                                rank: 1,
+                            },
+                        ],
+                    }],
+                }),
+                finished: None,
+            }),
+            Ok(DecodedTextEvent::TextDelta {
+                delta: String::new(),
+                token_ids: vec![b'!' as u32],
+                logprobs: Some(DecodedLogprobs {
+                    positions: vec![DecodedPositionLogprobs {
+                        entries: vec![
+                            DecodedTokenLogprob {
+                                token_id: 0,
+                                token: "!".to_string(),
+                                logprob: -0.3,
+                                rank: 1,
+                            },
+                            DecodedTokenLogprob {
+                                token_id: 0,
+                                token: "?".to_string(),
+                                logprob: -0.4,
+                                rank: 1,
+                            },
+                        ],
+                    }],
+                }),
+                finished: Some(Finished {
+                    usage: vllm_llm::TokenUsage {
+                        prompt_token_count: 5,
+                        output_token_count: 2,
+                        cached_token_count: 3,
+                    },
+                    finish_reason: FinishReason::Repetition(Some(StopReason::Text(
+                        "repetition_detected".to_string(),
+                    ))),
+                    kv_transfer_params: None,
+                    ec_transfer_params: None,
+                }),
+            }),
+        ]);
+
+        let chunks = completion_chunk_stream(
+            stream,
+            "cmpl-1".to_string(),
+            "model".to_string(),
+            1,
+            ApiServerOptions {
+                enable_prompt_tokens_details: true,
+                ..Default::default()
+            },
+            ResponseOptions {
+                include_usage: true,
+                requested_logprobs: Some(1),
+                ..Default::default()
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let chunks: Vec<_> = chunks.into_iter().try_collect().expect("stream should succeed");
+
+        assert!(chunks.windows(2).all(|pair| {
+            Arc::ptr_eq(
+                &chunk_response(&pair[0]).envelope,
+                &chunk_response(&pair[1]).envelope,
+            )
+        }));
+
+        match &chunks[0] {
+            CompletionSseChunk::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].text, "h");
+                assert_eq!(
+                    chunk.choices[0].logprobs.as_ref().expect("logprobs").tokens,
+                    vec!["h".to_string()]
+                );
+                assert_eq!(
+                    chunk.choices[0].logprobs.as_ref().expect("logprobs").text_offset,
+                    vec![0]
+                );
+            }
+            CompletionSseChunk::Usage(_) => panic!("expected regular chunk"),
+        }
+
+        match &chunks[1] {
+            CompletionSseChunk::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].text, "");
+                assert_eq!(
+                    chunk.choices[0].logprobs.as_ref().expect("logprobs").tokens,
+                    vec!["!".to_string()]
+                );
+                assert_eq!(
+                    chunk.choices[0].logprobs.as_ref().expect("logprobs").text_offset,
+                    vec![1]
+                );
+            }
+            CompletionSseChunk::Usage(_) => panic!("expected regular chunk"),
+        }
+
+        match &chunks[2] {
+            CompletionSseChunk::Chunk(chunk) => {
+                assert_eq!(
+                    chunk.choices[0].finish_reason.as_deref(),
+                    Some("repetition")
+                );
+                assert_eq!(
+                    chunk.choices[0].stop_reason,
+                    Some(serde_json::json!("repetition_detected"))
+                );
+            }
+            CompletionSseChunk::Usage(_) => panic!("expected regular chunk"),
+        }
+
+        match &chunks[3] {
+            CompletionSseChunk::Usage(chunk) => {
+                assert_eq!(
+                    chunk
+                        .usage
+                        .as_ref()
+                        .expect("usage")
+                        .prompt_tokens_details
+                        .as_ref()
+                        .map(|details| details.cached_tokens),
+                    Some(3)
+                );
+            }
+            CompletionSseChunk::Chunk(_) => panic!("expected usage chunk"),
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_completion_hides_internal_prompt_only_token() {
+        let stream = stream::iter(vec![
+            Ok(DecodedTextEvent::Start {
+                prompt_token_ids: vec![1, 2].into(),
+                prompt_logprobs: None,
+            }),
+            Ok(DecodedTextEvent::TextDelta {
+                delta: " leaked".to_string(),
+                token_ids: vec![3],
+                logprobs: None,
+                finished: Some(Finished {
+                    usage: vllm_llm::TokenUsage {
+                        prompt_token_count: 2,
+                        output_token_count: 1,
+                        cached_token_count: 0,
+                    },
+                    finish_reason: FinishReason::Length,
+                    kv_transfer_params: None,
+                    ec_transfer_params: None,
+                }),
+            }),
+        ]);
+
+        let response = super::collect_completion(
+            stream,
+            "cmpl-1".to_string(),
+            "model".to_string(),
+            1,
+            ApiServerOptions::default(),
+            ResponseOptions {
+                prompt_only: true,
+                echo: Some("hello".to_string()),
+                return_token_ids: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("collect completion");
+
+        assert_eq!(response.choices[0].text, "hello");
+        assert_eq!(response.choices[0].token_ids.as_deref(), Some(&[3][..]));
+        assert_eq!(
+            response.choices[0].prompt_token_ids.as_deref(),
+            Some(&[1, 2][..])
+        );
+        let usage = response.usage.expect("usage");
+        assert_eq!(usage.prompt_tokens, 2);
+        assert_eq!(usage.completion_tokens, Some(1));
+        assert_eq!(usage.total_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn collect_completion_maps_prompt_logprobs_for_single_token_prompt() {
+        let stream = stream::iter(vec![
+            Ok(DecodedTextEvent::Start {
+                prompt_token_ids: vec![9707].into(),
+                prompt_logprobs: None,
+            }),
+            Ok(DecodedTextEvent::TextDelta {
+                delta: " leaked".to_string(),
+                token_ids: vec![3],
+                logprobs: None,
+                finished: Some(Finished {
+                    usage: vllm_llm::TokenUsage {
+                        prompt_token_count: 1,
+                        output_token_count: 1,
+                        cached_token_count: 0,
+                    },
+                    finish_reason: FinishReason::Length,
+                    kv_transfer_params: None,
+                    ec_transfer_params: None,
+                }),
+            }),
+        ]);
+
+        let response = super::collect_completion(
+            stream,
+            "cmpl-1".to_string(),
+            "model".to_string(),
+            1,
+            ApiServerOptions::default(),
+            ResponseOptions {
+                prompt_only: true,
+                echo: Some("Hello".to_string()),
+                requested_logprobs: Some(1),
+                include_prompt_logprobs: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("collect completion");
+
+        let choice = &response.choices[0];
+        assert_eq!(choice.text, "Hello");
+        assert_eq!(choice.prompt_logprobs, Some(vec![None]));
+        let logprobs = choice.logprobs.as_ref().expect("logprobs");
+        assert_eq!(logprobs.tokens, vec!["Hello".to_string()]);
+        assert_eq!(logprobs.token_logprobs, vec![None]);
+        assert_eq!(logprobs.top_logprobs, vec![None]);
+        assert_eq!(logprobs.text_offset, vec![0]);
+        let usage = response.usage.expect("usage");
+        assert_eq!(usage.prompt_tokens, 1);
+        assert_eq!(usage.completion_tokens, Some(1));
+        assert_eq!(usage.total_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn completion_chunk_stream_hides_internal_prompt_only_token() {
+        let stream = stream::iter(vec![
+            Ok(DecodedTextEvent::Start {
+                prompt_token_ids: vec![1, 2].into(),
+                prompt_logprobs: None,
+            }),
+            Ok(DecodedTextEvent::TextDelta {
+                delta: " leaked".to_string(),
+                token_ids: vec![3],
+                logprobs: None,
+                finished: Some(Finished {
+                    usage: vllm_llm::TokenUsage {
+                        prompt_token_count: 2,
+                        output_token_count: 1,
+                        cached_token_count: 0,
+                    },
+                    finish_reason: FinishReason::Length,
+                    kv_transfer_params: None,
+                    ec_transfer_params: None,
+                }),
+            }),
+        ]);
+
+        let chunks = completion_chunk_stream(
+            stream,
+            "cmpl-1".to_string(),
+            "model".to_string(),
+            1,
+            ApiServerOptions::default(),
+            ResponseOptions {
+                include_usage: true,
+                prompt_only: true,
+                echo: Some("hello".to_string()),
+                return_token_ids: true,
+                ..Default::default()
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let chunks: Vec<_> = chunks.into_iter().try_collect().expect("stream should succeed");
+        assert_eq!(chunks.len(), 3);
+
+        match &chunks[0] {
+            CompletionSseChunk::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].text, "hello");
+                assert_eq!(
+                    chunk.choices[0].prompt_token_ids.as_deref(),
+                    Some(&[1, 2][..])
+                );
+            }
+            CompletionSseChunk::Usage(_) => panic!("expected prompt chunk"),
+        }
+        match &chunks[1] {
+            CompletionSseChunk::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].text, "");
+                assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
+            }
+            CompletionSseChunk::Usage(_) => panic!("expected final chunk"),
+        }
+        match &chunks[2] {
+            CompletionSseChunk::Usage(chunk) => {
+                let usage = chunk.usage.as_ref().expect("usage");
+                assert_eq!(usage.prompt_tokens, 2);
+                assert_eq!(usage.completion_tokens, Some(1));
+                assert_eq!(usage.total_tokens, 3);
+            }
+            CompletionSseChunk::Chunk(_) => panic!("expected usage chunk"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_chunk_stream_maps_prompt_logprobs_for_single_token_prompt() {
+        let stream = stream::iter(vec![
+            Ok(DecodedTextEvent::Start {
+                prompt_token_ids: vec![9707].into(),
+                prompt_logprobs: None,
+            }),
+            Ok(DecodedTextEvent::TextDelta {
+                delta: " leaked".to_string(),
+                token_ids: vec![3],
+                logprobs: None,
+                finished: Some(Finished {
+                    usage: vllm_llm::TokenUsage {
+                        prompt_token_count: 1,
+                        output_token_count: 1,
+                        cached_token_count: 0,
+                    },
+                    finish_reason: FinishReason::Length,
+                    kv_transfer_params: None,
+                    ec_transfer_params: None,
+                }),
+            }),
+        ]);
+
+        let chunks = completion_chunk_stream(
+            stream,
+            "cmpl-1".to_string(),
+            "model".to_string(),
+            1,
+            ApiServerOptions::default(),
+            ResponseOptions {
+                prompt_only: true,
+                echo: Some("Hello".to_string()),
+                requested_logprobs: Some(1),
+                ..Default::default()
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let chunks: Vec<_> = chunks.into_iter().try_collect().expect("stream should succeed");
+        assert_eq!(chunks.len(), 2);
+
+        match &chunks[0] {
+            CompletionSseChunk::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].text, "Hello");
+                let logprobs = chunk.choices[0].logprobs.as_ref().expect("logprobs");
+                assert_eq!(logprobs.tokens, vec!["Hello".to_string()]);
+                assert_eq!(logprobs.token_logprobs, vec![None]);
+                assert_eq!(logprobs.top_logprobs, vec![None]);
+                assert_eq!(logprobs.text_offset, vec![0]);
+            }
+            CompletionSseChunk::Usage(_) => panic!("expected prompt chunk"),
+        }
+        match &chunks[1] {
+            CompletionSseChunk::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].text, "");
+                assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
+            }
+            CompletionSseChunk::Usage(_) => panic!("expected final chunk"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_chunk_stream_maps_prompt_only_logprobs() {
+        let stream = stream::iter(vec![
+            Ok(DecodedTextEvent::Start {
+                prompt_token_ids: vec![1, 2].into(),
+                prompt_logprobs: Some(DecodedPromptLogprobs {
+                    first_token_id: 1,
+                    first_token: "he".to_string(),
+                    scored_positions: vec![DecodedPositionLogprobs {
+                        entries: vec![DecodedTokenLogprob {
+                            token_id: 2,
+                            token: "llo".to_string(),
+                            logprob: -0.2,
+                            rank: 1,
+                        }],
+                    }],
+                }),
+            }),
+            Ok(DecodedTextEvent::TextDelta {
+                delta: " leaked".to_string(),
+                token_ids: vec![3],
+                logprobs: None,
+                finished: Some(Finished {
+                    usage: vllm_llm::TokenUsage {
+                        prompt_token_count: 2,
+                        output_token_count: 1,
+                        cached_token_count: 0,
+                    },
+                    finish_reason: FinishReason::Length,
+                    kv_transfer_params: None,
+                    ec_transfer_params: None,
+                }),
+            }),
+        ]);
+
+        let chunks = completion_chunk_stream(
+            stream,
+            "cmpl-1".to_string(),
+            "model".to_string(),
+            1,
+            ApiServerOptions::default(),
+            ResponseOptions {
+                prompt_only: true,
+                echo: Some("hello".to_string()),
+                requested_logprobs: Some(1),
+                ..Default::default()
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
+
+        let chunks: Vec<_> = chunks.into_iter().try_collect().expect("stream should succeed");
+        assert_eq!(chunks.len(), 2);
+
+        match &chunks[0] {
+            CompletionSseChunk::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].text, "hello");
+                let logprobs = chunk.choices[0].logprobs.as_ref().expect("logprobs");
+                assert_eq!(logprobs.tokens, vec!["he".to_string(), "llo".to_string()]);
+                assert_eq!(logprobs.token_logprobs, vec![None, Some(-0.2)]);
+                assert_eq!(logprobs.text_offset, vec![0, 2]);
+            }
+            CompletionSseChunk::Usage(_) => panic!("expected prompt chunk"),
+        }
+        match &chunks[1] {
+            CompletionSseChunk::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].text, "");
+                assert_eq!(chunk.choices[0].finish_reason.as_deref(), Some("length"));
+            }
+            CompletionSseChunk::Usage(_) => panic!("expected final chunk"),
+        }
+    }
+}

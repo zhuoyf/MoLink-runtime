@@ -371,3 +371,174 @@ fn safe_text_event(
 ) -> ModalResult<JsonToolCallEvent> {
     safe_text_len(input, config.start_marker).map(|len| JsonToolCallEvent::Text { len })
 }
+
+#[cfg(test)]
+mod tests {
+    use expect_test::expect;
+
+    use super::{JsonToolCallConfig, JsonToolCallParser, JsonToolCallWhitespace};
+    use crate::tool::ToolParserOutput;
+
+    const DELIMITED_CONFIG: JsonToolCallConfig = JsonToolCallConfig {
+        parser_name: "Delimited JSON",
+        start_marker: "<tool_calls>",
+        end_marker: "</tool_calls>",
+        marker_whitespace: JsonToolCallWhitespace::Optional,
+        delimiter: Some("<"),
+        name_key: "function",
+        arguments_key: &["parameters"],
+    };
+
+    fn build_tool_call(function_name: &str, arguments: &str) -> String {
+        format!(r#"{{"function":"{function_name}","parameters":{arguments}}}"#)
+    }
+
+    fn build_tool_calls(tool_calls: &[String]) -> String {
+        format!("<tool_calls>{}</tool_calls>", tool_calls.join(" <\n"))
+    }
+
+    fn collect_chunks(parser: &mut JsonToolCallParser, chunks: &[&str]) -> ToolParserOutput {
+        let mut output = ToolParserOutput::default();
+        for chunk in chunks {
+            parser.parse_into(chunk, &mut output).unwrap();
+        }
+        output.append(parser.finish().unwrap());
+        output.coalesce()
+    }
+
+    #[test]
+    fn json_tool_call_tolerates_whitespace_before_outer_brace() {
+        // Pretty-printed JSON puts whitespace between the arguments object's `}`
+        // and the outer object's `}`; it must still parse (json.loads parity).
+        let mut whole = JsonToolCallParser::new(DELIMITED_CONFIG);
+        let whole_output = collect_chunks(
+            &mut whole,
+            &[r#"<tool_calls>{"function":"f","parameters":{"x":1} }</tool_calls>"#],
+        );
+        assert_eq!(whole_output.calls().len(), 1);
+        assert_eq!(whole_output.calls()[0].name.as_deref(), Some("f"));
+        assert_eq!(whole_output.calls()[0].arguments, r#"{"x":1}"#);
+
+        // Same input, but the whitespace before the outer `}` is split across a
+        // chunk boundary (exercises `ws0` returning Incomplete on `Partial`).
+        let mut chunked = JsonToolCallParser::new(DELIMITED_CONFIG);
+        let chunked_output = collect_chunks(
+            &mut chunked,
+            &[
+                r#"<tool_calls>{"function":"f","parameters":{"x":1}"#,
+                " ",
+                "}</tool_calls>",
+            ],
+        );
+        assert_eq!(chunked_output.calls().len(), 1);
+        assert_eq!(chunked_output.calls()[0].arguments, r#"{"x":1}"#);
+    }
+
+    #[test]
+    fn json_tool_call_delimiter_extracts_multiple_calls_in_one_block() {
+        let input = build_tool_calls(&[
+            build_tool_call("get_weather", r#"{"location":"Shanghai"}"#),
+            build_tool_call("add", r#"{"x":1,"y":2}"#),
+        ]);
+        let mut parser = JsonToolCallParser::new(DELIMITED_CONFIG);
+
+        let output = collect_chunks(&mut parser, &[&input]);
+
+        expect![[r#"
+            ToolParserOutput {
+                events: [
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 0,
+                            name: Some(
+                                "get_weather",
+                            ),
+                            arguments: "{\"location\":\"Shanghai\"}",
+                        },
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 1,
+                            name: Some(
+                                "add",
+                            ),
+                            arguments: "{\"x\":1,\"y\":2}",
+                        },
+                    ),
+                ],
+            }
+        "#]]
+        .assert_debug_eq(&output);
+    }
+
+    #[test]
+    fn json_tool_call_delimiter_can_arrive_in_later_chunk() {
+        let mut parser = JsonToolCallParser::new(DELIMITED_CONFIG);
+        let chunks = [
+            r#"<tool_calls>{"function":"get_weather","parameters":{"location":"Shanghai"}}"#,
+            " <\n",
+            r#"{"function":"add","parameters":{"x":1,"y":2}}"#,
+            "</tool_calls>",
+        ];
+
+        let output = collect_chunks(&mut parser, &chunks);
+
+        expect![[r#"
+            ToolParserOutput {
+                events: [
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 0,
+                            name: Some(
+                                "get_weather",
+                            ),
+                            arguments: "{\"location\":\"Shanghai\"}",
+                        },
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 1,
+                            name: Some(
+                                "add",
+                            ),
+                            arguments: "{\"x\":1,\"y\":2}",
+                        },
+                    ),
+                ],
+            }
+        "#]]
+        .assert_debug_eq(&output);
+    }
+
+    #[test]
+    fn json_tool_call_end_marker_wins_over_delimiter_prefix() {
+        let mut parser = JsonToolCallParser::new(DELIMITED_CONFIG);
+        let chunks = [
+            r#"<tool_calls>{"function":"get_weather","parameters":{"location":"Shanghai"}}"#,
+            " ",
+            "</tool_calls> trailing text",
+        ];
+
+        let output = collect_chunks(&mut parser, &chunks);
+
+        expect![[r#"
+            ToolParserOutput {
+                events: [
+                    Text(
+                        " trailing text",
+                    ),
+                    ToolCall(
+                        ToolCallDelta {
+                            tool_index: 0,
+                            name: Some(
+                                "get_weather",
+                            ),
+                            arguments: "{\"location\":\"Shanghai\"}",
+                        },
+                    ),
+                ],
+            }
+        "#]]
+        .assert_debug_eq(&output);
+    }
+}

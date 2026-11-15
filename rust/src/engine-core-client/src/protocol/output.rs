@@ -367,3 +367,163 @@ pub fn decode_engine_core_outputs(frames: &[Bytes]) -> Result<EngineCoreOutputs>
     outputs.resolve_in_place(frames)?;
     Ok(outputs)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use crate::protocol::output::EngineCoreOutput;
+    use crate::protocol::{decode_msgpack, encode_msgpack};
+
+    #[test]
+    fn engine_core_outputs_roundtrip_finished_fields() {
+        let outputs = WireEngineCoreOutputs {
+            outputs: vec![EngineCoreOutput {
+                request_id: "req-1".to_string(),
+                new_token_ids: vec![42],
+                finish_reason: Some(EngineCoreFinishReason::Length),
+                stop_reason: Some(StopReason::Text("stop".to_string())),
+                ..Default::default()
+            }],
+            finished_requests: Some(BTreeSet::from(["req-1".to_string()])),
+            ..Default::default()
+        };
+
+        let encoded = encode_msgpack(&outputs).unwrap();
+        let decoded: WireEngineCoreOutputs = decode_msgpack(&encoded).unwrap();
+
+        assert_eq!(decoded.outputs.len(), 1);
+        assert_eq!(
+            decoded.outputs[0].finish_reason,
+            Some(EngineCoreFinishReason::Length)
+        );
+        assert_eq!(
+            decoded.finished_requests,
+            Some(BTreeSet::from(["req-1".to_string()]))
+        );
+    }
+
+    #[test]
+    fn engine_core_outputs_classify_request_batch() {
+        let outputs = WireEngineCoreOutputs {
+            outputs: vec![EngineCoreOutput {
+                request_id: "req-1".to_string(),
+                new_token_ids: vec![7],
+                ..Default::default()
+            }],
+            finished_requests: Some(BTreeSet::from(["req-1".to_string()])),
+            ..Default::default()
+        };
+
+        expect_test::expect![[r#"
+            RequestBatch(
+                RequestBatchOutputs {
+                    engine_index: 0,
+                    outputs: [
+                        EngineCoreOutput {
+                            request_id: "req-1",
+                            new_token_ids: [
+                                7,
+                            ],
+                            new_logprobs: None,
+                            new_prompt_logprobs_tensors: None,
+                            pooling_output: None,
+                            finish_reason: None,
+                            stop_reason: None,
+                            events: None,
+                            kv_transfer_params: None,
+                            ec_transfer_params: None,
+                            trace_headers: None,
+                            prefill_stats: None,
+                            routed_experts: None,
+                            num_nans_in_logits: 0,
+                            mm_cache_miss_hashes: None,
+                            new_sampling_mask: None,
+                            spec_decode_metrics: None,
+                        },
+                    ],
+                    scheduler_stats: None,
+                    timestamp: 0.0,
+                    finished_requests: Some(
+                        {
+                            "req-1",
+                        },
+                    ),
+                },
+            )
+        "#]]
+        .assert_debug_eq(&EngineCoreOutputs::try_from(outputs).unwrap());
+    }
+
+    #[test]
+    fn engine_core_outputs_classify_utility() {
+        let outputs = WireEngineCoreOutputs {
+            utility_output: Some(UtilityOutput {
+                call_id: 42_u64.into(),
+                failure_message: None,
+                result: None,
+            }),
+            ..Default::default()
+        };
+
+        expect_test::expect![[r#"
+            Utility(
+                UtilityCallOutput {
+                    engine_index: 0,
+                    timestamp: 0.0,
+                    output: UtilityOutput {
+                        call_id: 42,
+                        failure_message: None,
+                        result: None,
+                    },
+                },
+            )
+        "#]]
+        .assert_debug_eq(&EngineCoreOutputs::try_from(outputs).unwrap());
+    }
+
+    #[test]
+    fn engine_core_outputs_classify_control() {
+        let outputs = WireEngineCoreOutputs {
+            start_wave: Some(3),
+            ..Default::default()
+        };
+
+        expect_test::expect![[r#"
+            DpControl(
+                DpControlOutput {
+                    engine_index: 0,
+                    timestamp: 0.0,
+                    control: StartWave(
+                        3,
+                    ),
+                },
+            )
+        "#]]
+        .assert_debug_eq(&EngineCoreOutputs::try_from(outputs).unwrap());
+    }
+
+    #[test]
+    fn engine_core_outputs_rejects_mixed_shape() {
+        let outputs = WireEngineCoreOutputs {
+            outputs: vec![EngineCoreOutput {
+                request_id: "req-1".to_string(),
+                new_token_ids: vec![7],
+                ..Default::default()
+            }],
+            utility_output: Some(UtilityOutput {
+                call_id: 1_u64.into(),
+                failure_message: None,
+                result: None,
+            }),
+            ..Default::default()
+        };
+
+        let error = EngineCoreOutputs::try_from(outputs).unwrap_err();
+        expect_test::expect![[
+            r#"messagepack decode failed for EngineCoreOutputs: invalid wire shape"#
+        ]]
+        .assert_eq(&error.to_string());
+    }
+}
