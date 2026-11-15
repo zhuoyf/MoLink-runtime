@@ -258,3 +258,6 @@ csrc/cpu/cpu_attn_dispatch_generated.h
 # Local pipeline reconfiguration measurements
 /benchmark_results/
 /pp_reconfigure_logs/
+
+# Dynamic PP runtime artifacts
+/runtime/

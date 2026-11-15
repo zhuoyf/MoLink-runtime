@@ -294,6 +294,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         self.step_timing = StepTimingCollector()
+        self._molink_compute_events: (
+            tuple[torch.cuda.Event, torch.cuda.Event] | None
+        ) = None
 
         # General request states.
         self.req_states = RequestState(
@@ -1731,6 +1734,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.step_timing.record_batch(
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
+        if events := getattr(self, "_molink_compute_events", None):
+            # Exclude PP receive waits and input preparation from compute cost.
+            events[0].record()
         self.step_timing.forward_start()
 
         # Run model.

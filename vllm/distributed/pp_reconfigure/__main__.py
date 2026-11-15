@@ -11,7 +11,7 @@ from pathlib import Path
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default="http://127.0.0.1:26010")
+    parser.add_argument("--url", default="http://127.0.0.1:8000")
     parser.add_argument("--output")
     commands = parser.add_subparsers(dest="command", required=True)
     monitor = commands.add_parser("monitor")
@@ -19,12 +19,12 @@ def main():
     monitor.add_argument("--samples", type=int, default=0, help="0: until interrupted")
     migrate = commands.add_parser("reconfigure")
     migrate.add_argument("--boundary", type=int, required=True)
+    migrate.add_argument("--mode", choices=("sync", "async"), default="async")
     args = parser.parse_args()
     output = (
         Path(args.output)
         if args.output
-        else Path("/workspace/molink-reconfiguration-results/monitoring")
-        / f"{args.command}.log"
+        else Path("runtime/control") / f"{args.command}.log"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     if args.command == "monitor" and args.interval <= 0:
@@ -33,7 +33,7 @@ def main():
     data = (
         None
         if args.command == "monitor"
-        else json.dumps({"boundary": args.boundary}).encode()
+        else json.dumps({"boundary": args.boundary, "mode": args.mode}).encode()
     )
     count = 0
     while True:

@@ -39,6 +39,37 @@ from vllm.v1.engine.output_processor import OutputProcessor
 
 pytestmark = pytest.mark.cpu_test
 
+
+@pytest.mark.parametrize(
+    "action,owner,timeout",
+    [
+        ("close", "other-owner", 10),
+        ("renew", "other-owner", 10),
+        ("open", "owner", 10),
+        ("renew", "owner", float("nan")),
+        ("close", "", 10),
+    ],
+)
+def test_migration_admission_rejections_preserve_rpc_validation_category(
+    action, owner, timeout
+):
+    from vllm.distributed.pp_reconfigure.admission import MigrationAdmissionGate
+    from vllm.v1.engine import UtilityOutput
+    from vllm.v1.engine.core import EngineCoreProc
+
+    gate = MigrationAdmissionGate()
+    gate.update("open", "owner", 60)
+    outputs: list[UtilityOutput] = []
+    EngineCoreProc._invoke_utility_method(
+        "molink_admission_gate",
+        lambda: gate.update(action, owner, timeout),
+        UtilityOutput(1),
+        outputs.append,
+    )
+    assert outputs[0].failure_category == "validation"
+    assert gate.status()["owner"] == "owner"
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

@@ -1,144 +1,105 @@
-# Pipeline reconfiguration
+# MoLink Runtime
 
-The `vllm.distributed.pp_reconfigure` package migrates model layers and KV cache
-between two pipeline stages while preserving active requests. It provides
-synchronous migration, online migration with incremental KV patches, and online
-migration with a final synchronization only.
+基于 **vLLM 0.29.0+molink.cu129** 的动态 Pipeline Parallel 推理运行时。
+当前动态重配置路径支持本地 Llama、PP=2、TP=1、V2 Model Runner、
+BF16、eager 和 Triton Attention。CUDA 内核使用同版本预编译 wheel。
 
-## Components
+保留异构 GPU 状态采集、Profiling、在线成本更新与切分点选择；
+权重迁移、非连续 Attention、Layer Stacking、KV Shrink/Expand、历史 KV、
+Dirty Bitmap、增量 Patch、安全 Commit，以及显存预检、Admission Gate 和恢复机制。
+TEE 只保留扩展接口，运行时安全模式为 `off`。
 
-| Module | Responsibility |
+## 安装
+
+Linux x86_64、Python 3.12、两张 CUDA GPU。使用 `uv`：
+
+```bash
+uv venv --python 3.12
+uv pip install --python .venv/bin/python --no-deps -r requirements/runtime-cu129.txt
+export VLLM_VERSION_OVERRIDE=0.29.0+molink.cu129
+export VLLM_USE_PRECOMPILED=1
+export VLLM_PRECOMPILED_WHEEL_LOCATION=https://github.com/vllm-project/vllm/releases/download/v0.29.0/vllm-0.29.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl
+uv pip install --python .venv/bin/python --no-deps --no-build-isolation -e .
+uv pip check --python .venv/bin/python
+```
+
+`requirements/runtime-cu129.txt` 固定运行时及构建依赖的完整版本集合；
+其他平台依赖与原生构建文件保留上游结构。此版本的动态 PP 启动入口使用 Python 服务端。
+
+## 启动
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 bash scripts/serve.sh /path/to/llama \
+  --max-model-len 512 --max-num-seqs 8 --max-num-batched-tokens 128 \
+  --num-gpu-blocks-override 128 --gpu-memory-utilization 0.8
+```
+
+默认监听 `127.0.0.1:8000`，启动脚本固定所需运行模式，其余参数透传给 `vllm serve`。
+未配置自动调度器时，按初始切分持续静态推理，也可手动迁移。
+服务启用开发控制接口；仅向受信任的管理网络开放。
+64 MiB `/dev/shm` 容器可设置 `NCCL_BUFFSIZE=1048576`、
+`NCCL_SHM_DISABLE=0`、`VLLM_MQ_MAX_CHUNK_BYTES_MB=1`。
+
+```bash
+curl http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"/path/to/llama","prompt":"The capital of France is","max_tokens":32,"temperature":0}'
+.venv/bin/python -m vllm.distributed.pp_reconfigure monitor --samples 1
+.venv/bin/python -m vllm.distributed.pp_reconfigure reconfigure --boundary 18
+```
+
+`boundary=18` 表示 32 层模型使用 `18/14` 分层；必须是合法的 stack 对齐内部分界。
+默认控制命令使用完整异步迁移，也可传 `--mode sync`。
+
+| 参数 | 用途 |
 | --- | --- |
-| `control.py` | Transaction coordination, admission checks, pause, commit and recovery |
-| `worker.py` | Layer binding, weight manifests and worker transaction state |
-| `live.py` | Background history transfer, patching and resource retirement |
-| `cache.py` | Address-based, layer-stacked KV allocations |
-| `resize.py` | Scheduler block capacity and stable logical block IDs |
-| `patching.py` | Dirty slots, allocation generations and patch versions |
-| `communication.py` | Ordered control messages and migration NCCL operations |
-| `weights.py` | Budgeted CPU weight caching and checkpoint loading |
-| `monitor.py`, `resource_monitor.py` | Transaction logs and resource snapshots |
+| `CUDA_VISIBLE_DEVICES` | 两张 GPU 的顺序 |
+| `VLLM_PP_LAYER_PARTITION=16,16` | 初始分层；缺省由 vLLM 分配 |
+| `VLLM_PP_RECONFIGURE_STACK_SIZE=2` | KV Layer Stacking 粒度 |
+| `VLLM_PP_RECONFIGURE_LOG_DIR` | 迁移事务日志，默认 `runtime/migrations` |
+| `HETVLLM_RESOURCE_MONITOR_LOG` | 节点监控日志，默认 `runtime/resources` |
+| `VLLM_PP_ADAPTIVE_PROFILE` | 自动调度所需的本机、本模型 Profiling 文件 |
+| `VLLM_PP_ADAPTIVE_CONFIG` | JSON 策略参数，如 `{"horizon":60,"cooldown":30,"min_gain":0.05}` |
+| `VLLM_PP_ADAPTIVE_INTERVAL=5` | 自动决策间隔（秒） |
+| `VLLM_PP_ADAPTIVE_LOG_DIR` | 调度日志，默认 `runtime/adaptive` |
 
-The current implementation supports two local GPUs, TP=1, a local Llama
-checkpoint, uniform unquantized full attention, eager execution, and the Triton
-attention backend. Stage count stays fixed. Both current and target layer
-boundaries must align to the configured stack size; unsupported targets are
-rejected before committing a configuration change.
+## Profiling 与自动调度
 
-## Configuration
-
-Environment variables are registered in `vllm.envs`. Set them consistently on
-all workers before starting the server.
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `VLLM_PP_RECONFIGURE_ENABLED` | `0` | Enable the reconfiguration control interface |
-| `VLLM_PP_RECONFIGURE_ONLINE` | `0` | Allocate address-based KV caches for online migration |
-| `VLLM_PP_RECONFIGURE_STACK_SIZE` | `2` | Number of layers in a physical KV stack |
-| `VLLM_PP_RECONFIGURE_KV_TRANSPORT` | `nixl` | Synchronous transport: `nixl` or `pp`; use `pp` for online mode |
-| `VLLM_PP_RECONFIGURE_WEIGHT_CACHE_BYTES` | `0` | Per-worker CPU weight tensor budget; zero loads from checkpoint |
-| `VLLM_PP_RECONFIGURE_DEFER_CLEANUP` | `1` | Clean up retired allocations after resuming generation |
-| `VLLM_PP_RECONFIGURE_PROFILE` | `0` | Capture migration CUDA activity for diagnostics |
-| `VLLM_PP_RECONFIGURE_PROFILE_CPU` | `0` | Include CPU activity when profiling is enabled |
-| `VLLM_PP_RECONFIGURE_LOG_DIR` | `pp_reconfigure_logs` | Local transaction output directory |
-
-`VLLM_PP_LAYER_PARTITION` specifies the initial number of layers on each stage.
-A stack size of four requires boundaries divisible by four; use a stack size of
-two for a two-layer migration.
-
-## Transaction and consistency
-
-1. Validate the partition, checkpoint and common intermediate KV capacity.
-2. Prepare incoming weights and detached KV allocations. Keep existing handles
-   for retained layers and preserve logical block IDs during shrink/expand.
-3. Transfer history for referenced blocks, including shared active prefixes.
-   Evict idle cached prefixes before omitting their blocks from the manifest.
-   Disabled and null blocks are excluded.
-4. Track writes and block copies in a dirty bitmap. Gather all moving layers
-   into immutable payloads bounded by 64 MiB, then transfer them in the background.
-   Admission reserves 128 MiB for gather and payload buffers.
-5. Pause and drain inference after history finishes and the original token-lag
-   convergence condition is met. Apply the final dirty set and synchronize both
-   workers before committing the new partition.
-6. Resume generation, retire old allocations, and restore feasible KV capacity.
-   Further migration and resize operations wait for resource retirement.
-
-Each patch carries a transaction ID, a strictly increasing version and block
-allocation generations. Fresh logical ownership advances the generation;
-shared prefix references retain it. The destination filters older generations,
-and the source marks the entire reused block dirty without advancing the token
-watermark. Acknowledgement follows completed device application. Final versions
-and watermarks must agree before commit.
-
-An unchanged generation observation does not wait for an in-flight patch;
-actual ownership updates still take the lifecycle lock. Incoming shadow KV is
-separate from the cache currently used by inference. Source gathers wait for
-previous writes, and the next forward waits for gather completion before
-reusing the source slots.
-
-CPU metadata waits do not hold the GPU communication lock. NCCL payloads and
-sampling broadcasts retain their completion-event ordering. Rollback quiesces
-background threads and device work before restoring the old configuration.
-Post-commit cleanup errors preserve the committed partition rather than
-restoring retired resources.
-
-CPU weight caching uses a bounded LRU with background prefetch. Missing,
-disabled or over-budget entries retain the checkpoint loading path. The budget
-covers cached tensors, not total process RSS.
-
-## Running the benchmark
-
-Create a deterministic ten-layer checkpoint using a compatible local tokenizer:
+先在空闲设备上校准通信，使用与服务相同的 GPU 顺序和 NCCL 环境：
 
 ```bash
-uv run --no-project --python .venv/bin/python \
-  benchmarks/pp_reconfigure/prepare_tiny_model.py \
-  --output /tmp/pp-test-model --tokenizer /path/to/llama-tokenizer
-
-MODEL=/tmp/pp-test-model VLLM_PP_LAYER_PARTITION=8,2 \
-  bash benchmarks/pp_reconfigure/serve_online.sh
+mkdir -p runtime/profile
+.venv/bin/python -m torch.distributed.run --nproc-per-node 2 \
+  -m vllm.distributed.pp_reconfigure.network_profile \
+  --output runtime/profile/network.json
 ```
 
-In another terminal:
+然后启动专用于校准的服务（暂不设置 `VLLM_PP_ADAPTIVE_PROFILE`），运行：
 
 ```bash
-uv run --no-project --python .venv/bin/python \
-  benchmarks/pp_reconfigure/compare_migration.py \
-  --model pp-reconfigure-test --boundaries 6 8 --iterations 1 --verify-kv \
-  --output benchmark_results/pp_reconfigure/continuity.json
+.venv/bin/python -m vllm.distributed.pp_reconfigure.profile \
+  --model /path/to/llama --stack 2 --out runtime/profile
 ```
 
-The existing project service integration exposes `POST /molink/reconfigure`:
+校准会遍历合法切分、发送短请求并测量迁移，结束后恢复初始切分。
+匹配的校准文件默认复用，`--force` 重采。完成后停止校准服务，使用同一启动命令，
+增加 `VLLM_PP_ADAPTIVE_PROFILE="$PWD/runtime/profile/profile.json"`。
+模型配置、dtype、stack 与 GPU UUID 必须匹配；缺少可信样本或收益不足时保持当前切分。
+迁移异常后自动调度锁止，需要检查事务日志并重启。
 
-```json
-{"boundary": 6, "mode": "async", "verify_kv": false}
-```
+管理接口：`GET /molink/monitor`、`/resource_status`、`/adaptive/status`、
+`/migration_capacity?boundary=18`、`/admission`；
+`POST /molink/reconfigure`、`/resize_kv`、`/admission`。
+Admission Gate 使用有期限的租约，限制新请求进入而让已运行请求排空。
 
-Modes are `sync`, `async`, and `async_no_patching`. The API default is `sync`.
-`GET /molink/monitor` returns scheduler and worker state. The controller
-serializes transactions, and HTTP client cancellation does not abort a running
-migration. Inspect monitor state and transaction logs after an HTTP failure.
+## 目录
 
-`total_ms` ends after cleanup and capacity restoration, before the final state
-snapshot RPC. `pause_ms` includes draining and ends when Resume returns.
-`timings_ms` records individual host phases. Client token gaps and actual CUDA
-kernel overlap are separate measurements; event-window estimates and Commit
-time alone do not establish service pause or device overlap. KV verification
-and profiling add overhead and should be disabled in latency measurements.
+- `vllm/distributed/pp_reconfigure/`：迁移、KV 管理、准入、监控、校准与控制命令。
+- `vllm/distributed/pp_reconfigure/adaptive/`：成本模型、优化器、在线调度、TEE 接口。
+- `vllm/entrypoints/serve/dev/molink/`：管理 API 与调度器生命周期。
+- `vllm/v1/`、`vllm/model_executor/`：推理引擎和模型集成。
+- `scripts/serve.sh`：统一启动入口。
+- `requirements/`、`csrc/`、`cmake/`、`rust/`、`tools/`：依赖和上游构建支持。
 
-`analyze_migration.py` summarizes migration costs and optional CUDA kernel
-overlap. See the [benchmark guide](../../benchmarks/pp_reconfigure/README.md)
-for workload parameters and analysis commands. Generated measurements belong
-under `benchmark_results/` or outside the repository.
-
-## Tests
-
-```bash
-uv run --no-project --python .venv/bin/python -m pytest \
-  tests/v1/worker/test_pp_reconfigure.py -q
-```
-
-The suite covers cache addressing, block lifetime, generations, patch ordering,
-resource budgets, rollback and asynchronous cleanup. Real-GPU continuity runs
-verify tokens against a static baseline and compare final KV digests in both
-directions. Test artifacts are local and are not part of the source package.
+运行数据写入被 Git 忽略的 `runtime/`；模型权重、日志和校准产物不属于发布源码。
+许可证为 Apache-2.0，见 `LICENSE`。
