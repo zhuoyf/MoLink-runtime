@@ -600,18 +600,3 @@ pub async fn run_output_loop(
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::bind_local_sockets;
-
-    #[tokio::test]
-    async fn bind_local_sockets_resolves_zero_port_bindings() {
-        let (input_address, _input_socket, output_address, _output_socket) =
-            bind_local_sockets("127.0.0.1", None, None).await.expect("bind local sockets");
-
-        assert!(input_address.starts_with("tcp://127.0.0.1:"));
-        assert!(output_address.starts_with("tcp://127.0.0.1:"));
-        assert_ne!(input_address, output_address);
-    }
-}

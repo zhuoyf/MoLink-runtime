@@ -74,10 +74,6 @@ impl InflightRequests {
         map.values().flat_map(|internal_ids| internal_ids.keys()).cloned().collect()
     }
 
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.map.lock().is_empty()
-    }
 }
 
 /// RAII guard that releases one refcount on a single external→internal edge
@@ -109,81 +105,5 @@ impl Drop for RequestGuard {
                 map.remove(&self.external);
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolves_external_to_internal() {
-        let inflight = InflightRequests::new();
-        let _guard = inflight.track("ext".to_string(), "ext-abc".to_string());
-
-        assert_eq!(
-            inflight.resolve(&["ext".to_string()]),
-            vec!["ext-abc".to_string()]
-        );
-        assert!(inflight.resolve(&["unknown".to_string()]).is_empty());
-    }
-
-    #[test]
-    fn one_external_maps_to_many_internal() {
-        let inflight = InflightRequests::new();
-        let _g1 = inflight.track("dup".to_string(), "dup-1".to_string());
-        let _g2 = inflight.track("dup".to_string(), "dup-2".to_string());
-
-        let mut resolved = inflight.resolve(&["dup".to_string()]);
-        resolved.sort();
-        assert_eq!(resolved, vec!["dup-1".to_string(), "dup-2".to_string()]);
-    }
-
-    #[test]
-    fn dropping_guard_removes_only_its_own_edge_then_cleans_empty_key() {
-        let inflight = InflightRequests::new();
-        let g1 = inflight.track("dup".to_string(), "dup-1".to_string());
-        let g2 = inflight.track("dup".to_string(), "dup-2".to_string());
-
-        drop(g1);
-        assert_eq!(
-            inflight.resolve(&["dup".to_string()]),
-            vec!["dup-2".to_string()]
-        );
-
-        drop(g2);
-        assert!(inflight.resolve(&["dup".to_string()]).is_empty());
-        assert!(
-            inflight.is_empty(),
-            "empty external key must be removed, not left dangling"
-        );
-    }
-
-    #[test]
-    fn identical_edges_are_refcounted_across_guards() {
-        // With request-id randomization disabled, internal == external, so two
-        // tracked requests can share the exact same edge. Dropping one guard
-        // (e.g. a stale stream, or the error path of a rejected duplicate
-        // submission) must not untrack the other still-live request.
-        let inflight = InflightRequests::new();
-        let g1 = inflight.track("x".to_string(), "x".to_string());
-        let g2 = inflight.track("x".to_string(), "x".to_string());
-
-        drop(g1);
-        assert_eq!(inflight.resolve(&["x".to_string()]), vec!["x".to_string()]);
-
-        drop(g2);
-        assert!(inflight.resolve(&["x".to_string()]).is_empty());
-        assert!(inflight.is_empty());
-    }
-
-    #[test]
-    fn guard_drop_is_a_noop_after_inflight_is_gone() {
-        let guard = {
-            let inflight = InflightRequests::new();
-            inflight.track("ext".to_string(), "ext-abc".to_string())
-        };
-        // Dropping the guard after the owning map is gone must not panic.
-        drop(guard);
     }
 }

@@ -450,10 +450,6 @@ impl EngineCoreClient {
         self.config.transport_mode.data_parallel_size()
     }
 
-    #[cfg(test)]
-    pub(crate) fn pending_utility_call_count(&self) -> usize {
-        self.inner.pending_utility_call_count()
-    }
 
     /// Return the engine-side indices connected to this client.
     pub fn engine_indices(&self) -> Vec<u32> {

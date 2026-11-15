@@ -54,19 +54,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     )
 }
 
-#[cfg(test)]
-fn build_router_with_dev_mode(state: Arc<AppState>, dev_mode_enabled: bool) -> Router {
-    build_router_with_dev_mode_and_lora(state, dev_mode_enabled, false)
-}
 
-#[cfg(test)]
-fn build_router_with_dev_mode_and_lora(
-    state: Arc<AppState>,
-    dev_mode_enabled: bool,
-    runtime_lora_updating_enabled: bool,
-) -> Router {
-    build_router_with_options(state, dev_mode_enabled, runtime_lora_updating_enabled)
-}
 
 fn build_router_with_options(
     state: Arc<AppState>,

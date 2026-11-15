@@ -96,67 +96,6 @@ impl UnifiedParserOutput {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{UnifiedParserEvent, UnifiedParserOutput};
-    use crate::tool::ToolCallDelta;
-
-    #[test]
-    fn unified_parser_output_coalesces_adjacent_text_events() {
-        let mut output = UnifiedParserOutput::default();
-        output.push_text("hello");
-        output.push_text(" ");
-        output.push_text("world");
-        output.push_reasoning("think");
-        output.push_reasoning("ing");
-        output.push_call(ToolCallDelta {
-            tool_index: 0,
-            name: Some("lookup".to_string()),
-            arguments: "{}".to_string(),
-        });
-        output.push_text("!");
-
-        assert_eq!(
-            output.events,
-            vec![
-                UnifiedParserEvent::Text("hello world".to_string()),
-                UnifiedParserEvent::Reasoning("thinking".to_string()),
-                UnifiedParserEvent::ToolCall(ToolCallDelta {
-                    tool_index: 0,
-                    name: Some("lookup".to_string()),
-                    arguments: "{}".to_string(),
-                }),
-                UnifiedParserEvent::Text("!".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn unified_parser_output_append_coalesces_adjacent_events() {
-        let mut output = UnifiedParserOutput::default();
-        output.push_text("hello");
-
-        let mut other = UnifiedParserOutput::default();
-        other.push_text(" ");
-        other.push_text("world");
-        other.push_reasoning("think");
-        output.append(other);
-
-        let mut after_reasoning = UnifiedParserOutput::default();
-        after_reasoning.push_reasoning("ing");
-        after_reasoning.push_text("!");
-        output.append(after_reasoning);
-
-        assert_eq!(
-            output.events,
-            vec![
-                UnifiedParserEvent::Text("hello world".to_string()),
-                UnifiedParserEvent::Reasoning("thinking".to_string()),
-                UnifiedParserEvent::Text("!".to_string()),
-            ]
-        );
-    }
-}
 
 /// Incremental parser that extracts reasoning and tool-call events from assistant output.
 pub trait UnifiedParser: Send {

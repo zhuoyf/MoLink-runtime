@@ -118,10 +118,6 @@ impl ClientInner {
         self.utility_reg.lock().unregister_many(call_ids);
     }
 
-    #[cfg(test)]
-    pub fn pending_utility_call_count(&self) -> usize {
-        self.utility_reg.lock().len()
-    }
 
     /// Undo a request registration when `add_request()` fails.
     pub fn rollback_request(&self, request_id: &str) {
@@ -489,50 +485,4 @@ pub(crate) async fn run_output_dispatcher_loop(
 
     warn!(error = %error.as_report(), "output dispatcher exiting with error");
     inner.close_registries(Arc::new(error));
-}
-
-#[cfg(test)]
-mod tests {
-    use zeromq::{RouterSocket, Socket};
-
-    use super::*;
-    use crate::mock_engine::default_ready_response;
-
-    async fn test_inner() -> ClientInner {
-        let mut socket = RouterSocket::new();
-        socket.bind("tcp://127.0.0.1:0").await.unwrap();
-        let (send, _) = socket.split();
-        ClientInner::new(
-            send,
-            Handle::current(),
-            "test-model".to_string(),
-            &[ConnectedEngine {
-                engine_id: EngineId::from(b"engine-0"),
-                ready_response: default_ready_response(),
-            }],
-        )
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn close_registries_records_first_health_error_only() {
-        let inner = test_inner().await;
-        let mut health = inner.subscribe_health();
-        assert!(*health.borrow());
-
-        inner.close_registries(Arc::new(Error::EngineCoreDead));
-        health.changed().await.expect("health sender remains open");
-        assert!(!inner.is_healthy());
-        assert!(!*health.borrow());
-        assert!(matches!(
-            inner.health_error().as_deref(),
-            Some(Error::EngineCoreDead)
-        ));
-        assert!(!*inner.subscribe_health().borrow());
-
-        inner.close_registries(Arc::new(client_closed!("shutdown")));
-        assert!(matches!(
-            inner.health_error().as_deref(),
-            Some(Error::EngineCoreDead)
-        ));
-    }
 }

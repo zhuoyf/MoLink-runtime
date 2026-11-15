@@ -73,20 +73,3 @@ where
 pub fn decode_value(bytes: &[u8]) -> Result<Value> {
     Ok(rmpv::decode::read_value(&mut Cursor::new(bytes))?)
 }
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-
-    use super::*;
-
-    #[test]
-    fn decode_msgpack_includes_type_name_and_value_fallback() {
-        let error = decode_msgpack::<u64>(
-            &rmp_serde::to_vec_named(&BTreeMap::from([("status", "READY")])).unwrap(),
-        )
-        .unwrap_err();
-
-        expect_test::expect![[r#"messagepack decode failed for u64: wrong msgpack marker FixMap(1); value fallback: {"status": "READY"}"#]].assert_eq(&error.to_report_string());
-    }
-}

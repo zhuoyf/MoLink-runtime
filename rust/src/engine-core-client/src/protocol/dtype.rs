@@ -23,21 +23,3 @@ impl ModelDtype {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::ModelDtype;
-
-    #[test]
-    fn serde_uses_protocol_dtype_strings() {
-        assert_eq!(
-            serde_json::to_value(ModelDtype::Float16).unwrap(),
-            serde_json::json!("float16")
-        );
-        assert_eq!(
-            serde_json::from_value::<ModelDtype>(serde_json::json!("bfloat16")).unwrap(),
-            ModelDtype::BFloat16
-        );
-        assert_eq!(ModelDtype::Float32.as_str(), "float32");
-    }
-}

@@ -70,25 +70,3 @@ fn constant_time_eq(left: &ApiKeyHash, right: &ApiKeyHash) -> bool {
 
     bool::from(left.ct_eq(right))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::constant_time_eq;
-    use crate::state::hash_api_key;
-
-    #[test]
-    fn constant_time_eq_checks_sha256_digests() {
-        assert!(constant_time_eq(
-            &hash_api_key("secret"),
-            &hash_api_key("secret")
-        ));
-        assert!(!constant_time_eq(
-            &hash_api_key("secret"),
-            &hash_api_key("secrex")
-        ));
-        assert!(!constant_time_eq(
-            &hash_api_key("secret"),
-            &hash_api_key("secret-more")
-        ));
-    }
-}

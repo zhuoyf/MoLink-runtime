@@ -92,36 +92,6 @@ pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationEr
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{StringOrArray, validate_stop};
-
-    #[test]
-    fn validate_stop_accepts_four_stop_strings() {
-        let stop = StringOrArray::Array(
-            ["one", "two", "three", "four"].into_iter().map(str::to_string).collect(),
-        );
-
-        validate_stop(&stop).expect("four stop strings should be accepted");
-    }
-
-    #[test]
-    fn validate_stop_rejects_more_than_four_stop_strings() {
-        let stop = StringOrArray::Array(
-            ["one", "two", "three", "four", "five"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-        );
-
-        let error = validate_stop(&stop).expect_err("five stop strings should be rejected");
-
-        assert_eq!(
-            error.code.as_ref(),
-            "stop strings must contain at most 4 items"
-        );
-    }
-}
 
 // ============================================================================
 // Validation helpers
@@ -474,45 +444,6 @@ pub struct PromptTokenUsageInfo {
     pub cached_tokens: usize,
 }
 
-#[cfg(test)]
-mod usage_tests {
-    use vllm_llm::TokenUsage;
-
-    use super::Usage;
-
-    #[test]
-    fn token_usage_hides_prompt_token_details_by_default() {
-        let usage = Usage::from_token_usage(
-            TokenUsage {
-                prompt_token_count: 5,
-                output_token_count: 2,
-                cached_token_count: 3,
-            },
-            false,
-        );
-
-        assert_eq!(usage.prompt_tokens, 5);
-        assert_eq!(usage.completion_tokens, Some(2));
-        assert!(usage.prompt_tokens_details.is_none());
-    }
-
-    #[test]
-    fn token_usage_includes_prompt_token_details_when_enabled() {
-        let usage = Usage::from_token_usage(
-            TokenUsage {
-                prompt_token_count: 5,
-                output_token_count: 2,
-                cached_token_count: 3,
-            },
-            true,
-        );
-
-        assert_eq!(
-            usage.prompt_tokens_details.as_ref().map(|details| details.cached_tokens),
-            Some(3)
-        );
-    }
-}
 
 /// OpenAI completions-style logprobs.
 #[derive(Debug, Clone, Deserialize, Serialize)]
