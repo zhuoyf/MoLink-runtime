@@ -5,6 +5,8 @@
 import math
 import time
 
+from vllm.distributed.pp_reconfigure.errors import ReconfigurationValidationError
+
 
 class MigrationAdmissionGate:
     def __init__(self):
@@ -52,12 +54,16 @@ class MigrationAdmissionGate:
     def update(self, action, owner, timeout=10, requests=()):
         self.status()
         if not isinstance(owner, str) or not owner:
-            raise ValueError("admission lease requires an owner")
+            raise ReconfigurationValidationError("admission lease requires an owner")
         if action == "open":
             if not math.isfinite(timeout) or not 0 < timeout <= 600:
-                raise ValueError("admission timeout must be in (0, 600]")
+                raise ReconfigurationValidationError(
+                    "admission timeout must be in (0, 600]"
+                )
             if self.owner is not None:
-                raise ValueError("migration admission gate already owned")
+                raise ReconfigurationValidationError(
+                    "migration admission gate already owned"
+                )
             self.owner = owner
             self.started = time.monotonic()
             self.deadline = self.started + timeout
@@ -78,15 +84,17 @@ class MigrationAdmissionGate:
                 or not math.isfinite(timeout)
                 or not 0 < timeout <= 600
             ):
-                raise ValueError("invalid admission lease renewal")
+                raise ReconfigurationValidationError("invalid admission lease renewal")
             self.deadline = time.monotonic() + timeout
         elif action == "close":
             if self.owner is not None and self.owner != owner:
-                raise ValueError("migration admission gate owner mismatch")
+                raise ReconfigurationValidationError(
+                    "migration admission gate owner mismatch"
+                )
             if self.owner is not None:
                 self._close("released")
         else:
-            raise ValueError("unknown admission action")
+            raise ReconfigurationValidationError("unknown admission action")
         return self.status()
 
     def allows(self, request):
